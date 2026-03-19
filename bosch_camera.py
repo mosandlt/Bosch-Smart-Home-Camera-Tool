@@ -797,7 +797,12 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
                     with frame_lock:
                         frame = current_frame[0]
                     if frame:
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                        header = (
+                            f"--frame\r\n"
+                            f"Content-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(frame)}\r\n\r\n"
+                        ).encode()
+                        self.wfile.write(header)
                         self.wfile.write(frame)
                         self.wfile.write(b"\r\n")
                         self.wfile.flush()
@@ -805,8 +810,8 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    server = http.server.HTTPServer(("127.0.0.1", port), MJPEGHandler)
-    server.timeout = 0.5
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MJPEGHandler)
+    server.daemon_threads = True
 
     threading.Thread(target=fetcher, daemon=True).start()
 
@@ -821,15 +826,41 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
         stop_event.set()
         return
 
-    server_thread = threading.Thread(
-        target=lambda: [server.handle_request() for _ in iter(stop_event.is_set, True)],
-        daemon=True,
-    )
+    def _serve():
+        server.serve_forever()
+
+    server_thread = threading.Thread(target=_serve, daemon=True)
     server_thread.start()
 
     mjpeg_url = f"http://127.0.0.1:{port}/"
-    cmd = [ffplay, "-loglevel", "warning", "-window_title", f"Live: {cam_name}", mjpeg_url]
-    proc = subprocess.Popen(cmd)
+
+    # On macOS, ffplay launched as a subprocess doesn't get a window session.
+    # Use 'open -a' to properly bring the player to the foreground.
+    if sys.platform == "darwin":
+        # Try mpv first (works as CLI subprocess), then VLC via open -a
+        mpv = shutil.which("mpv")
+        vlc = "/Applications/VLC.app/Contents/MacOS/VLC"
+        if mpv:
+            cmd = [mpv, "--no-terminal", "--title", f"Live: {cam_name}", mjpeg_url]
+            print(f"  ▶️   Launching mpv: {mjpeg_url}")
+            proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+        elif os.path.exists(vlc):
+            cmd = [vlc, "--intf", "macosx", mjpeg_url]
+            print(f"  ▶️   Launching VLC: {mjpeg_url}")
+            proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+        else:
+            # ffplay via open — write a tiny shell script and open it
+            script = os.path.join(BASE_DIR, "_live_ffplay.sh")
+            with open(script, "w") as f:
+                f.write(f"#!/bin/sh\n{ffplay} -loglevel warning -f mjpeg -window_title 'Live: {cam_name}' '{mjpeg_url}'\n")
+            os.chmod(script, 0o755)
+            cmd = ["open", "-W", "-a", "Terminal", script]
+            print(f"  ▶️   Launching ffplay via Terminal: {mjpeg_url}")
+            proc = subprocess.Popen(cmd)
+    else:
+        cmd = [ffplay, "-loglevel", "warning", "-f", "mjpeg", "-window_title", f"Live: {cam_name}", mjpeg_url]
+        print(f"  ▶️   Launching: {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
     try:
         proc.wait()
@@ -837,6 +868,7 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
         proc.kill()
     finally:
         stop_event.set()
+        server.shutdown()
         print(f"\n  ⏹️   Live view stopped.")
 
 
