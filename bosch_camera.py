@@ -845,7 +845,7 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
             print(f"  ▶️   Launching mpv: {mjpeg_url}")
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
         elif os.path.exists(vlc):
-            cmd = [vlc, "--intf", "macosx", mjpeg_url]
+            cmd = ["open", "-a", "VLC", mjpeg_url]
             print(f"  ▶️   Launching VLC: {mjpeg_url}")
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
         else:
@@ -869,6 +869,53 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
     finally:
         stop_event.set()
         server.shutdown()
+        print(f"\n  ⏹️   Live view stopped.")
+
+
+def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "") -> None:
+    """
+    Open live audio+video stream via rtsps:// (RTSP over TLS on port 443).
+    Uses VLC on macOS. Falls back to snap.jpg MJPEG loop if VLC is unavailable.
+
+    Discovery: the cloud proxy speaks real RTSP/1.0 over TLS on port 443.
+    Port 42090 (from the API response) only serves HTTP snap.jpg and silently
+    drops all RTSP connections. Replace port 42090 → 443 and use rtsps://.
+    """
+    ffplay = shutil.which("ffplay") or "/opt/homebrew/bin/ffplay"
+    mpv    = shutil.which("mpv")
+    vlc    = "/Applications/VLC.app/Contents/MacOS/VLC"
+
+    if ffplay and os.path.exists(ffplay):
+        # ffplay handles rtsps:// fine from subprocess (unlike MJPEG which needs a window session)
+        cmd = [ffplay,
+               "-rtsp_transport", "tcp",
+               "-tls_verify", "0",
+               "-loglevel", "warning",
+               "-window_title", f"Live: {cam_name}",
+               rtsps_url]
+        print(f"  ▶️   Launching ffplay (audio+video): {rtsps_url}")
+        proc = subprocess.Popen(cmd)
+    elif mpv:
+        cmd = [mpv, "--no-terminal", "--title", f"Live: {cam_name}",
+               "--rtsp-tls-verification=no", rtsps_url]
+        print(f"  ▶️   Launching mpv (audio+video): {rtsps_url}")
+        proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    elif os.path.exists(vlc):
+        # VLC via open -a — TLS verification may block self-signed certs
+        cmd = ["open", "-a", "VLC", "--args", rtsps_url]
+        print(f"  ▶️   Launching VLC (audio+video): {rtsps_url}")
+        proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    else:
+        print("  ⚠️   No VLC or mpv found — falling back to snap.jpg MJPEG (video only).")
+        if fallback_snap_url:
+            _live_snap_loop(fallback_snap_url, cam_name)
+        return
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.kill()
+    finally:
         print(f"\n  ⏹️   Live view stopped.")
 
 
@@ -914,26 +961,16 @@ def cmd_live(cfg: dict, args) -> None:
         if result:
             urls       = result.get("urls", [])
             img_scheme = result.get("imageUrlScheme", "https://{url}/snap.jpg")
-            vid_scheme = result.get("videoUrlScheme", "")
             user       = result.get("user") or ""
             password   = result.get("password") or ""
 
-            proxy_url = ""
-            rtsp_url  = ""
-            if urls:
-                u = urls[0]
-                proxy_url = img_scheme.replace("{url}", u)
-                if vid_scheme:
-                    rtsp_url = vid_scheme.replace("{url}", u)
-
+            proxy_url = img_scheme.replace("{url}", urls[0]) if urls else ""
             print(f"  🌐  Snap URL:  {proxy_url or '(none)'}")
-            print(f"  🎥  RTSP URL:  {rtsp_url or '(none)'}")
             if user:
                 print(f"  🔑  Creds: {user} / {password}")
 
             cfg["cameras"][name]["last_live"] = {
                 "type":      result_type,
-                "rtsp_url":  rtsp_url,
                 "proxy_url": proxy_url,
                 "user":      user,
                 "password":  password,
@@ -941,12 +978,21 @@ def cmd_live(cfg: dict, args) -> None:
             }
             save_config(cfg)
 
-            if proxy_url:
-                # Stream live via snap.jpg polling — RTSP tunnel is Bosch-proprietary
-                # and cannot be opened with standard players (VLC/ffplay)
-                _live_snap_loop(proxy_url, name)
+            if urls:
+                # Build rtsps:// URL on port 443 — the proxy serves real RTSP/1.0 over
+                # TLS on port 443 (port 42090 silently drops all RTSP connections).
+                # No auth needed — the hash in the path is the credential.
+                u = urls[0]  # e.g. proxy-20.live.cbs.boschsecurity.com:42090/{hash}
+                host_port, hash_path = u.split("/", 1)
+                proxy_host = host_port.split(":")[0]
+                rtsps_url = (
+                    f"rtsps://{proxy_host}:443/{hash_path}"
+                    f"/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60"
+                )
+                print(f"  📡  RTSPS URL: {rtsps_url}")
+                _open_rtsps_stream(rtsps_url, name, proxy_url)
             else:
-                print("  ⚠️   No snap URL in response.")
+                print("  ⚠️   No URLs in response.")
         else:
             print("\n  ❌  Could not open live connection.")
 
