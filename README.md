@@ -1,7 +1,7 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream — all from the command line.
+> Live snapshots, event downloads, live video stream, and privacy mode control — all from the command line.
 > No official API. No app needed after setup.
 
 ---
@@ -53,6 +53,8 @@ of Bosch's software was distributed. Only network protocol observations were use
 | Live stream in VLC | `live --vlc` |
 | Download all events (JPEG + MP4) | `download` |
 | Recent event list | `events` |
+| **Privacy mode — get/set via cloud API** | `privacy [cam] [on\|off]` |
+| Camera light schedule status | `light [cam]` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal (no browser) | automatic |
 
@@ -136,6 +138,16 @@ python3 bosch_camera.py download Outdoor --clips-only
 
 # Events list
 python3 bosch_camera.py events Outdoor --limit 20
+
+# Privacy mode
+python3 bosch_camera.py privacy                  # show all cameras' privacy state
+python3 bosch_camera.py privacy Outdoor          # show one camera's privacy state
+python3 bosch_camera.py privacy Outdoor on       # enable privacy mode
+python3 bosch_camera.py privacy Outdoor off      # disable privacy mode
+
+# Camera light schedule
+python3 bosch_camera.py light                    # all cameras
+python3 bosch_camera.py light Outdoor            # one camera
 
 # Config
 python3 bosch_camera.py config                   # show current config
@@ -394,10 +406,12 @@ SSL:       Use verify=False — Bosch uses a private root CA not in the system s
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v11/video_inputs` | List all cameras (id, title, model, firmware, mac) |
+| `GET` | `/v11/video_inputs` | List all cameras (id, title, model, firmware, mac, privacyMode) |
 | `GET` | `/v11/video_inputs/{id}` | Single camera details |
 | `GET` | `/v11/video_inputs/{id}/ping` | Returns `"ONLINE"` or `"OFFLINE"` |
 | `GET` | `/v11/video_inputs/{id}/firmware` | Firmware version info |
+| `GET` | `/v11/video_inputs/{id}/privacy` | Get privacy mode state (`{"privacyMode": "ON"/"OFF"}`) |
+| `PUT` | `/v11/video_inputs/{id}/privacy` | Set privacy mode (body: see below) |
 | `GET` | `/v11/events?videoInputId={id}` | All events for a camera |
 | `GET` | `/v11/events?videoInputId={id}&limit=N` | Limited event list |
 | `GET` | `{event.imageUrl}` | Download event JPEG snapshot |
@@ -406,6 +420,42 @@ SSL:       Use verify=False — Bosch uses a private root CA not in the system s
 | `GET` | `/v11/feature_flags` | Feature flags for the account |
 | `GET` | `/v11/purchases` | Subscription / purchase info |
 | `GET` | `/v11/contracts?locale=de_DE` | Contract info |
+
+### Privacy Mode
+
+```
+GET  /v11/video_inputs/{id}/privacy
+→ {"privacyMode": "ON"} or {"privacyMode": "OFF"}
+
+PUT  /v11/video_inputs/{id}/privacy
+Content-Type: application/json
+{"privacyMode": "ON", "durationInSeconds": null}
+→ HTTP 204 No Content on success
+```
+
+Also available from the `GET /v11/video_inputs` response — each camera object includes
+a top-level `"privacyMode"` field, so no extra poll is needed for status.
+
+### Camera Light Schedule (read-only via cloud API)
+
+The camera light schedule state is included in `GET /v11/video_inputs` per camera:
+
+```json
+"featureStatus": {
+  "scheduleStatus": "ALWAYS_OFF",
+  "frontIlluminatorInGeneralLightOn": false,
+  "frontIlluminatorGeneralLightIntensity": 1.0,
+  "generalLightOnTime": "20:15:00",
+  "generalLightOffTime": "22:35:00",
+  "darknessThreshold": 0.0,
+  "lightOnMotion": false,
+  "lightOnMotionFollowUpTimeSeconds": 60
+}
+```
+
+`featureSupport.light` (boolean) indicates whether the camera has a built-in LED indicator.
+**Light write control is not available via the cloud API** — no endpoint found for toggling
+the indicator LED. Control requires the SHC local API (mutual TLS, `PUT .../CameraLight/state`).
 
 ### Live Proxy Endpoints (after PUT /connection)
 
@@ -534,6 +584,9 @@ tool/
   There is no documented local API on the SHC for camera images.
 - **VLC needs ffmpeg** — the `live --vlc` option requires ffmpeg to proxy the stream,
   because VLC cannot skip TLS certificate verification for `rtsps://`.
+- **Camera light control** — the `light` command is read-only (shows schedule status
+  from cloud API). No cloud endpoint found for toggling the LED indicator.
+  Write control requires the SHC local API with mutual TLS.
 
 ---
 
