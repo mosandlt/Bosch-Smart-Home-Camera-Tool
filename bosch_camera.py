@@ -1159,6 +1159,154 @@ def cmd_info(cfg: dict, args) -> None:
         print()
 
 
+def cmd_privacy(cfg: dict, args) -> None:
+    """Get or set privacy mode for a camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py privacy [cam-name]        → show current state
+      python3 bosch_camera.py privacy [cam-name] on     → turn privacy ON
+      python3 bosch_camera.py privacy [cam-name] off    → turn privacy OFF
+
+    API: PUT /v11/video_inputs/{id}/privacy
+         Body: {"privacyMode": "ON"/"OFF", "durationInSeconds": null}
+         Response: HTTP 204 on success.
+    No SHC local API needed — uses cloud API directly.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)  # "on" / "off" / None
+
+    # If action was parsed as cam and cam_arg looks like an action, swap them
+    # (e.g. "privacy on" → cam=None, action="on")
+    if cam_arg and cam_arg.lower() in ("on", "off") and action is None:
+        action  = cam_arg.lower()
+        cam_arg = None
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    # Fetch current state from /v11/video_inputs
+    r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    r.raise_for_status()
+    cam_list = {cam.get("id"): cam for cam in r.json()}
+
+    for name, cam_info in cams.items():
+        cam_id  = cam_info["id"]
+        cam_raw = cam_list.get(cam_id, {})
+        current = cam_raw.get("privacyMode", "UNKNOWN")
+        icon    = "🔒" if current.upper() == "ON" else "👁️"
+
+        print(f"\n── Privacy Mode: {name} ─────────────────────────────────────")
+        print(f"  {icon}  Current state:  {current}")
+
+        if action is None:
+            # Status only
+            priv_url = f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy"
+            pr = session.get(priv_url, timeout=10)
+            if pr.status_code == 200:
+                pd = pr.json()
+                dur = pd.get("durationInSeconds")
+                end = pd.get("privacyTimeEnd")
+                print(f"       Duration:       {dur if dur else 'indefinite'}")
+                if end:
+                    print(f"       End time:       {end}")
+            print(f"\n  Run with 'on' or 'off' to toggle. E.g.:")
+            print(f"    python3 bosch_camera.py privacy {name.lower()} on")
+            continue
+
+        # Set privacy mode
+        new_state = "ON" if action == "on" else "OFF"
+        if current.upper() == new_state:
+            print(f"  ✅  Already {new_state} — no change needed.")
+            continue
+
+        print(f"  🔄  Setting privacy mode → {new_state}...")
+        body = {"privacyMode": new_state, "durationInSeconds": None}
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            icon_new = "🔒" if new_state == "ON" else "👁️"
+            print(f"  {icon_new}  Privacy mode set to {new_state}.")
+            if new_state == "ON":
+                print("     Camera is now blocked — no live images available.")
+            else:
+                print("     Camera is now active — live images available.")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_light(cfg: dict, args) -> None:
+    """Show camera light (illuminator) status from the Bosch cloud API.
+
+    Reads featureStatus.frontIlluminatorInGeneralLightOn and the light schedule
+    from the /v11/video_inputs response.
+
+    Light control via cloud API is not available — the Bosch cloud does not
+    expose a dedicated endpoint for it. Control requires the SHC local API
+    (shc_ip + cert/key in the HA integration options).
+
+    featureStatus fields:
+      scheduleStatus         — ALWAYS_OFF / ALWAYS_ON / SCHEDULE
+      frontIlluminatorInGeneralLightOn  — general light mode enabled
+      lightOnMotion          — activate light on motion detection
+      lightOnMotionFollowUpTimeSeconds  — how long after motion
+      generalLightOnTime / generalLightOffTime  — schedule window
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+
+    r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    r.raise_for_status()
+    cam_list = {cam.get("id"): cam for cam in r.json()}
+
+    for name, cam_info in cams.items():
+        cam_id  = cam_info["id"]
+        cam_raw = cam_list.get(cam_id, {})
+        feat_support = cam_raw.get("featureSupport", {})
+        has_light    = feat_support.get("light", False)
+        feat_status  = cam_raw.get("featureStatus", {})
+
+        print(f"\n── Camera Light: {name} ─────────────────────────────────────")
+        if not has_light:
+            print(f"  ℹ️   This camera does not support a built-in light.")
+            continue
+
+        sched     = feat_status.get("scheduleStatus", "UNKNOWN")
+        front_on  = feat_status.get("frontIlluminatorInGeneralLightOn", False)
+        intensity = feat_status.get("frontIlluminatorGeneralLightIntensity", 0)
+        wall_on   = feat_status.get("wallwasherInGeneralLightOn", False)
+        on_time   = feat_status.get("generalLightOnTime", "?")
+        off_time  = feat_status.get("generalLightOffTime", "?")
+        on_motion = feat_status.get("lightOnMotion", False)
+        follow_up = feat_status.get("lightOnMotionFollowUpTimeSeconds", 0)
+
+        mode_icon = {"ALWAYS_ON": "💡", "ALWAYS_OFF": "🌑", "SCHEDULE": "📅"}.get(sched, "❓")
+        print(f"  {mode_icon}  Schedule mode:       {sched}")
+        print(f"  {'💡' if front_on else '🌑'}  General light mode:  {'ON' if front_on else 'OFF'}  "
+              f"(intensity: {intensity:.0%})")
+        if wall_on:
+            print(f"  💡  Wallwasher:          ON")
+        print(f"  🕐  Schedule window:     {on_time} → {off_time}")
+        print(f"  🏃  Light on motion:     {'YES' if on_motion else 'NO'}  "
+              f"(follow-up: {follow_up}s)")
+        print()
+        print("  ℹ️   Light control not available via cloud API.")
+        print("      Use the HA integration with SHC configured for LED toggle.")
+
+
 def cmd_rescan(cfg: dict, args) -> None:
     """Re-discover cameras from API and update config."""
     token   = get_token(cfg)
@@ -1300,6 +1448,8 @@ Commands:
   live     [name]      Open live stream (audio+video, ffplay by default)
   download [name]      Bulk download all events (JPEG + MP4)
   events   [name]      Show recent event list
+  privacy  [name] [on|off]  Show or toggle privacy mode (cloud API, no SHC needed)
+  light    [name]      Show camera light / illuminator status (cloud API)
   config               Show current config file contents
   rescan               Re-discover cameras and update config
 
@@ -1308,6 +1458,7 @@ Run without arguments for the interactive menu.
     )
     parser.add_argument("command",        nargs="?",              help="Command")
     parser.add_argument("cam",            nargs="?",              help="Camera name (partial match)")
+    parser.add_argument("action",         nargs="?",              help="Action for privacy: on / off")
     parser.add_argument("--limit",        type=int, default=None, help="Max events")
     parser.add_argument("--snaps-only",   action="store_true",    help="Only JPEG snapshots")
     parser.add_argument("--clips-only",   action="store_true",    help="Only MP4 clips")
@@ -1347,6 +1498,8 @@ Run without arguments for the interactive menu.
         "stream":   cmd_live,
         "download": cmd_download,
         "events":   cmd_events,
+        "privacy":  cmd_privacy,
+        "light":    cmd_light,
         "config":   cmd_config,
         "rescan":   cmd_rescan,
     }
