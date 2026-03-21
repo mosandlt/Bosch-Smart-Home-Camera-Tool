@@ -1,8 +1,8 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, and privacy mode control — all from the command line.
-> No official API. No app needed after setup.
+> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, and pan control — all from the command line.
+> No official API. No app needed after setup. **v1.1.0**
 
 ---
 
@@ -54,9 +54,11 @@ of Bosch's software was distributed. Only network protocol observations were use
 | Download all events (JPEG + MP4) | `download` |
 | Recent event list | `events` |
 | **Privacy mode — get/set via cloud API** | `privacy [cam] [on\|off]` |
-| Camera light schedule status | `light [cam]` |
+| **Camera light — on/off via cloud API** | `light [cam] [on\|off]` |
+| **Push notifications — on/off** | `notifications [cam] [on\|off]` |
+| **Pan 360 camera** | `pan [cam] [left\|center\|right\|<-120..120>]` |
 | Automatic token via browser login | `get_token.py` |
-| Silent token renewal (no browser) | automatic |
+| Silent token renewal / token fix | `token [fix\|browser]` |
 
 ---
 
@@ -139,15 +141,33 @@ python3 bosch_camera.py download Outdoor --clips-only
 # Events list
 python3 bosch_camera.py events Outdoor --limit 20
 
-# Privacy mode
+# Privacy mode (cloud API — no SHC needed)
 python3 bosch_camera.py privacy                  # show all cameras' privacy state
 python3 bosch_camera.py privacy Outdoor          # show one camera's privacy state
 python3 bosch_camera.py privacy Outdoor on       # enable privacy mode
 python3 bosch_camera.py privacy Outdoor off      # disable privacy mode
 
-# Camera light schedule
-python3 bosch_camera.py light                    # all cameras
-python3 bosch_camera.py light Outdoor            # one camera
+# Camera light (cloud API — no SHC needed)
+python3 bosch_camera.py light                    # show light state (all cameras)
+python3 bosch_camera.py light Outdoor            # show light state (one camera)
+python3 bosch_camera.py light Outdoor on         # turn camera light on
+python3 bosch_camera.py light Outdoor off        # turn camera light off
+
+# Push notifications
+python3 bosch_camera.py notifications                # show notification state (all)
+python3 bosch_camera.py notifications Outdoor on     # enable notifications (FOLLOW_CAMERA_SCHEDULE)
+python3 bosch_camera.py notifications Outdoor off    # disable notifications (ALWAYS_OFF)
+
+# Pan (CAMERA_360 only)
+python3 bosch_camera.py pan Indoor left          # pan to left limit
+python3 bosch_camera.py pan Indoor center        # pan to center (0°)
+python3 bosch_camera.py pan Indoor right         # pan to right limit
+python3 bosch_camera.py pan Indoor 45            # pan to absolute position (degrees)
+
+# Token
+python3 bosch_camera.py token                    # show token info + expiry
+python3 bosch_camera.py token fix                # silent renewal via refresh_token
+python3 bosch_camera.py token browser            # force new browser login
 
 # Config
 python3 bosch_camera.py config                   # show current config
@@ -662,9 +682,7 @@ tool/
   There is no documented local API on the SHC for camera images.
 - **VLC needs ffmpeg** — the `live --vlc` option requires ffmpeg to proxy the stream,
   because VLC cannot skip TLS certificate verification for `rtsps://`.
-- **Camera light control** — the `light` command shows schedule status from the cloud API.
-  Manual light override (on/off) is writable via `PUT /v11/video_inputs/{id}/lighting_override`.
-  Full schedule control requires the SHC local API with mutual TLS.
+- **Camera light control** — the `light on/off` command uses `PUT /v11/video_inputs/{id}/lighting_override` (cloud API, no SHC needed). Full light schedule control (time-based scheduling) is only available via the SHC local API with mutual TLS.
 
 ---
 
