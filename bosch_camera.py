@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.0.0"
+VERSION     = "1.1.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -149,17 +149,56 @@ def _merge_defaults(cfg: dict, defaults: dict) -> None:
 
 # ══════════════════════════ TOKEN MANAGEMENT ══════════════════════════════════
 
+def _is_token_expired(token: str) -> bool:
+    """Return True if the JWT bearer token is expired or expiring within 60s."""
+    import base64 as _b64, json as _json
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            pad  = len(parts[1]) % 4
+            body = _b64.urlsafe_b64decode(parts[1] + "=" * pad)
+            exp  = _json.loads(body).get("exp", 0)
+            return exp > 0 and (exp - time.time()) < 60
+    except Exception:
+        pass
+    return False
+
+
 def get_token(cfg: dict) -> str:
     """
     Return a valid Bearer token. Tries in order:
-      1. Saved bearer_token in config
-      2. Silent renewal via refresh_token (Keycloak)
+      1. Saved bearer_token in config (if not expired)
+      2. Silent renewal via refresh_token (auto, no user interaction)
       3. Browser login via get_token.py (auto-opens browser)
       4. Manual paste as last resort
     """
     token = cfg["account"].get("bearer_token", "").strip()
-    if token:
+    if token and not _is_token_expired(token):
         return token
+
+    # Token expired or missing — try silent renewal first
+    refresh = cfg["account"].get("refresh_token", "").strip()
+    if refresh:
+        try:
+            from get_token import _do_refresh
+            if token:  # only print if we had a token (i.e. it expired)
+                print("  🔄  Token expired — renewing automatically via refresh_token...")
+            tokens = _do_refresh(refresh)
+            if tokens:
+                new_token   = tokens.get("access_token", "")
+                new_refresh = tokens.get("refresh_token", refresh)
+                cfg["account"]["bearer_token"]  = new_token
+                cfg["account"]["refresh_token"] = new_refresh
+                save_config(cfg)
+                print("  ✅  Token renewed silently.")
+                return new_token
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  ⚠️   Silent renewal failed: {e}")
+
+    if token:
+        return token  # Expired but renewal failed — return as-is and let the API reject it
 
     # Try get_token.py auto-flow (refresh + browser login)
     try:
@@ -191,10 +230,31 @@ def get_token(cfg: dict) -> str:
 
 
 def check_token_age(cfg: dict) -> str:
-    """Return human-readable age of bearer_token.txt or config file mtime."""
-    # Use config file mtime as proxy for token age
-    if not cfg["account"].get("bearer_token"):
+    """Return human-readable token expiry decoded from JWT claims."""
+    import base64 as _b64, json as _json
+    token = cfg["account"].get("bearer_token", "").strip()
+    if not token:
         return "no token"
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            pad  = len(parts[1]) % 4
+            body = _b64.urlsafe_b64decode(parts[1] + "=" * pad)
+            info = _json.loads(body)
+            exp  = info.get("exp", 0)
+            if exp:
+                exp_dt = datetime.datetime.fromtimestamp(exp)
+                diff   = exp_dt - datetime.datetime.now()
+                mins   = int(diff.total_seconds() / 60)
+                if mins > 5:
+                    return f"valid, expires in ~{mins}m ✅"
+                elif mins > 0:
+                    return f"expires in ~{mins}m ⚠️"
+                else:
+                    return f"EXPIRED {abs(mins)}m ago ❌  — run: python3 bosch_camera.py token fix"
+    except Exception:
+        pass
+    # Fallback to file mtime
     mtime = os.path.getmtime(CONFIG_FILE)
     age   = datetime.datetime.now() - datetime.datetime.fromtimestamp(mtime)
     mins  = int(age.total_seconds() / 60)
@@ -203,7 +263,7 @@ def check_token_age(cfg: dict) -> str:
     elif mins < 120:
         return f"~{mins} min old ⚠️  (may be expired)"
     else:
-        return f"~{mins} min old ❌  (likely expired — recapture needed)"
+        return f"~{mins} min old ❌  — run: python3 bosch_camera.py token fix"
 
 
 def handle_401(cfg: dict) -> str:
@@ -246,6 +306,7 @@ def discover_cameras(cfg: dict, session: requests.Session) -> dict:
         name = cam.get("title", cam.get("id", "unknown"))
         # Keep existing local config if camera already known
         existing = cfg.get("cameras", {}).get(name, {})
+        feat = cam.get("featureSupport", {})
         cameras[name] = {
             "id":              cam.get("id", ""),
             "name":            name,
@@ -256,6 +317,8 @@ def discover_cameras(cfg: dict, session: requests.Session) -> dict:
             "local_ip":        existing.get("local_ip", ""),
             "local_username":  existing.get("local_username", ""),
             "local_password":  existing.get("local_password", ""),
+            "has_light":       feat.get("light", False),
+            "pan_limit":       feat.get("panLimit", 0),
         }
         # Ask for local IP if not already set
         if not cameras[name]["local_ip"]:
@@ -1244,16 +1307,20 @@ def cmd_privacy(cfg: dict, args) -> None:
 
 
 def cmd_light(cfg: dict, args) -> None:
-    """Show camera light (illuminator) status from the Bosch cloud API.
+    """Get or set the camera light (manual override) via the Bosch cloud API.
 
-    Reads featureStatus.frontIlluminatorInGeneralLightOn and the light schedule
-    from the /v11/video_inputs response.
+    Usage:
+      python3 bosch_camera.py light [cam-name]        → show current state
+      python3 bosch_camera.py light [cam-name] on     → turn light ON
+      python3 bosch_camera.py light [cam-name] off    → turn light OFF
 
-    Light control via cloud API is not available — the Bosch cloud does not
-    expose a dedicated endpoint for it. Control requires the SHC local API
-    (shc_ip + cert/key in the HA integration options).
+    API: PUT /v11/video_inputs/{id}/lighting_override
+         ON:  {"frontLightOn": true, "wallwasherOn": true, "frontLightIntensity": 1.0}
+         OFF: {"frontLightOn": false, "wallwasherOn": false}
+         Response: HTTP 204 on success.
+    Only available for cameras with featureSupport.light = true (outdoor camera).
 
-    featureStatus fields:
+    featureStatus fields (shown in status view):
       scheduleStatus         — ALWAYS_OFF / ALWAYS_ON / SCHEDULE
       frontIlluminatorInGeneralLightOn  — general light mode enabled
       lightOnMotion          — activate light on motion detection
@@ -1263,7 +1330,15 @@ def cmd_light(cfg: dict, args) -> None:
     token   = get_token(cfg)
     session = make_session(token)
     cameras = get_cameras(cfg, session)
-    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)
+
+    # Allow "light on" / "light off" without camera name
+    if cam_arg and cam_arg.lower() in ("on", "off") and action is None:
+        action  = cam_arg.lower()
+        cam_arg = None
+
+    cams = resolve_cam(cfg, cam_arg)
 
     r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
     if r.status_code == 401:
@@ -1302,9 +1377,278 @@ def cmd_light(cfg: dict, args) -> None:
         print(f"  🕐  Schedule window:     {on_time} → {off_time}")
         print(f"  🏃  Light on motion:     {'YES' if on_motion else 'NO'}  "
               f"(follow-up: {follow_up}s)")
+
+        if action is None:
+            print()
+            print(f"  Run with 'on' or 'off' to toggle the manual override. E.g.:")
+            print(f"    python3 bosch_camera.py light {name.lower()} on")
+            continue
+
+        # Set manual light override via cloud API
+        new_state = action.upper()
+        print(f"\n  🔄  Setting light override → {new_state}...")
+        if action == "on":
+            body = {"frontLightOn": True, "wallwasherOn": True, "frontLightIntensity": 1.0}
+        else:
+            body = {"frontLightOn": False, "wallwasherOn": False}
+
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/lighting_override",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            icon_new = "💡" if action == "on" else "🌑"
+            print(f"  {icon_new}  Light override set to {new_state}.")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_pan(cfg: dict, args) -> None:
+    """Get or set the pan position of the 360 camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py pan [cam-name]           → show current position
+      python3 bosch_camera.py pan [cam-name] left      → pan to -120° (full left)
+      python3 bosch_camera.py pan [cam-name] center    → pan to 0° (center)
+      python3 bosch_camera.py pan [cam-name] right     → pan to +120° (full right)
+      python3 bosch_camera.py pan [cam-name] <-120..120>  → pan to absolute position
+
+    API: GET /v11/video_inputs/{id}/pan
+           → {"currentAbsolutePosition": 15, "panLimit": 120}
+         PUT /v11/video_inputs/{id}/pan
+           Body: {"absolutePosition": -120}   (range: -panLimit to +panLimit)
+           Response: {"currentAbsolutePosition": -120, "cameraStoppedAtLimit": false,
+                      "estimatedTimeToCompletion": 970}
+    Only available for cameras with featureSupport.panLimit > 0 (indoor 360 camera).
+    Discovered 2026-03-21 via mitmproxy capture.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)
+
+    # Allow "pan left" / "pan center" / "pan right" / "pan 45" without camera name
+    PRESETS = ("left", "center", "right")
+    if cam_arg and action is None:
+        try:
+            int(cam_arg)
+            action, cam_arg = cam_arg, None   # "pan 45" → action=45, cam=None
+        except ValueError:
+            if cam_arg.lower() in PRESETS:
+                action, cam_arg = cam_arg.lower(), None
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    r.raise_for_status()
+    cam_list = {cam.get("id"): cam for cam in r.json()}
+
+    for name, cam_info in cams.items():
+        cam_id      = cam_info["id"]
+        cam_raw     = cam_list.get(cam_id, {})
+        pan_limit   = cam_raw.get("featureSupport", {}).get("panLimit", 0)
+
+        print(f"\n── Pan Control: {name} ──────────────────────────────────────")
+        if not pan_limit:
+            print(f"  ℹ️   This camera does not support pan (panLimit=0).")
+            continue
+
+        # Fetch current position
+        pr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/pan", timeout=10)
+        if pr.status_code != 200:
+            print(f"  ❌  Could not fetch pan state: HTTP {pr.status_code}")
+            continue
+        pan_data = pr.json()
+        current  = pan_data.get("currentAbsolutePosition", 0)
+        limit    = pan_data.get("panLimit", pan_limit)
+
+        # Visual position bar
+        pct   = (current + limit) / (2 * limit)  # 0.0 = full left, 1.0 = full right
+        width = 30
+        pos   = int(pct * width)
+        bar   = "─" * pos + "●" + "─" * (width - pos)
+        direction = "CENTER" if abs(current) < 5 else ("RIGHT ▶" if current > 0 else "◀ LEFT")
+        print(f"  📍  Position:  {current:+4d}°  {direction}")
+        print(f"      Range:    -{limit}° ◀ [{bar}] ▶ +{limit}°")
+
+        if action is None:
+            print(f"\n  Run with 'left', 'center', 'right', or a number (-{limit}..+{limit}). E.g.:")
+            print(f"    python3 bosch_camera.py pan {name.lower()} center")
+            print(f"    python3 bosch_camera.py pan {name.lower()} 45")
+            continue
+
+        # Resolve target position
+        PRESET_MAP = {"left": -limit, "center": 0, "right": limit}
+        if action.lower() in PRESET_MAP:
+            target = PRESET_MAP[action.lower()]
+        else:
+            try:
+                target = int(action)
+            except ValueError:
+                print(f"  ❌  Unknown action '{action}'. Use left/center/right or a number.")
+                continue
+            if not (-limit <= target <= limit):
+                print(f"  ❌  Position {target} out of range (-{limit} to +{limit}).")
+                continue
+
+        if target == current:
+            print(f"  ✅  Already at {target:+d}° — no change needed.")
+            continue
+
+        direction_str = "▶ right" if target > current else "◀ left"
+        print(f"\n  🔄  Panning {direction_str} → {target:+d}°...")
+        resp = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/pan",
+            json={"absolutePosition": target},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            new_pos = data.get("currentAbsolutePosition", target)
+            eta_ms  = data.get("estimatedTimeToCompletion", 0)
+            at_limit = data.get("cameraStoppedAtLimit", False)
+            print(f"  ✅  Moving to {new_pos:+d}°  (ETA: {eta_ms}ms)")
+            if at_limit:
+                print(f"  ⚠️   Camera stopped at mechanical limit.")
+        else:
+            print(f"  ❌  Failed: HTTP {resp.status_code}  {resp.text[:200]}")
+
+
+def cmd_notifications(cfg: dict, args) -> None:
+    """Get or set notification settings for a camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py notifications [cam-name]        → show current state
+      python3 bosch_camera.py notifications [cam-name] on     → enable (FOLLOW_CAMERA_SCHEDULE)
+      python3 bosch_camera.py notifications [cam-name] off    → disable (ALWAYS_OFF)
+
+    API: PUT /v11/video_inputs/{id}/enable_notifications
+         Body: {"enabledNotificationsStatus": "FOLLOW_CAMERA_SCHEDULE"/"ALWAYS_OFF"}
+         Response: HTTP 204 on success.
+    State is visible in GET /v11/video_inputs as notificationsEnabledStatus.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)
+
+    if cam_arg and cam_arg.lower() in ("on", "off") and action is None:
+        action  = cam_arg.lower()
+        cam_arg = None
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    r.raise_for_status()
+    cam_list = {cam.get("id"): cam for cam in r.json()}
+
+    for name, cam_info in cams.items():
+        cam_id  = cam_info["id"]
+        cam_raw = cam_list.get(cam_id, {})
+        current = cam_raw.get("notificationsEnabledStatus", "UNKNOWN")
+        notif_on = current != "ALWAYS_OFF"
+        icon     = "🔔" if notif_on else "🔕"
+
+        print(f"\n── Notifications: {name} ─────────────────────────────────────")
+        print(f"  {icon}  Current state:  {current}")
+
+        if action is None:
+            print(f"\n  Run with 'on' or 'off' to toggle. E.g.:")
+            print(f"    python3 bosch_camera.py notifications {name.lower()} on")
+            continue
+
+        new_status = "FOLLOW_CAMERA_SCHEDULE" if action == "on" else "ALWAYS_OFF"
+        if current == new_status:
+            print(f"  ✅  Already {new_status} — no change needed.")
+            continue
+
+        print(f"  🔄  Setting notifications → {new_status}...")
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/enable_notifications",
+            json={"enabledNotificationsStatus": new_status},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            icon_new = "🔔" if action == "on" else "🔕"
+            print(f"  {icon_new}  Notifications set to {new_status}.")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_token(cfg: dict, args) -> None:
+    """Show token status and optionally renew it.
+
+    Usage:
+      python3 bosch_camera.py token          → show current status
+      python3 bosch_camera.py token fix      → renew via refresh_token (or browser)
+      python3 bosch_camera.py token browser  → force new browser login
+    """
+    import base64 as _b64
+
+    action = getattr(args, "cam", None) or getattr(args, "action", None)
+    if action:
+        action = action.lower()
+
+    acct    = cfg.get("account", {})
+    token   = acct.get("bearer_token", "").strip()
+    refresh = acct.get("refresh_token", "").strip()
+
+    print("\n── Token Status ─────────────────────────────────────────────")
+    if token:
+        print(f"  Access token:  {token[:24]}...  ({len(token)} chars)")
+        try:
+            parts = token.split(".")
+            pad   = len(parts[1]) % 4
+            info  = json.loads(_b64.urlsafe_b64decode(parts[1] + "=" * pad))
+            exp   = info.get("exp", 0)
+            exp_dt = datetime.datetime.fromtimestamp(exp)
+            diff   = exp_dt - datetime.datetime.now()
+            mins   = int(diff.total_seconds() / 60)
+            if mins > 0:
+                status = f"valid ~{mins}m ✅"
+            else:
+                status = f"EXPIRED {abs(mins)}m ago ❌"
+            print(f"  Email:         {info.get('email', info.get('preferred_username', ''))}")
+            print(f"  Expires:       {exp_dt.strftime('%Y-%m-%d %H:%M')}  ({status})")
+            expired = mins <= 0
+        except Exception:
+            print(f"  Status:        {check_token_age(cfg)}")
+            expired = False
+    else:
+        print("  Access token:  (none)")
+        expired = True
+
+    if refresh:
+        print(f"  Refresh token: {refresh[:20]}...  ({len(refresh)} chars) — auto-renewal ✅")
+    else:
+        print("  Refresh token: (none) — browser login needed")
+
+    if action in ("fix", "refresh", "renew", "browser"):
         print()
-        print("  ℹ️   Light control not available via cloud API.")
-        print("      Use the HA integration with SHC configured for LED toggle.")
+        force_browser = (action == "browser")
+        try:
+            from get_token import get_token_auto
+            new_token = get_token_auto(cfg, force_browser=force_browser)
+            if new_token:
+                print(f"\n  ✅  Token renewed successfully.")
+            else:
+                print(f"\n  ❌  Token renewal failed.")
+        except ImportError:
+            print("  ❌  get_token.py not found in the same folder.")
+    elif expired:
+        print()
+        print("  ➡️   To fix: python3 bosch_camera.py token fix")
+    print()
 
 
 def cmd_rescan(cfg: dict, args) -> None:
@@ -1324,6 +1668,11 @@ def cmd_menu(cfg: dict) -> None:
     """Interactive numbered menu."""
     cameras = cfg.get("cameras", {})
     cam_names = list(cameras.keys())
+
+    # Auto-renew token silently if expired before displaying status
+    token = cfg["account"].get("bearer_token", "").strip()
+    if not token or _is_token_expired(token):
+        get_token(cfg)
 
     print("""
 ╔══════════════════════════════════════════════════════════╗
@@ -1371,10 +1720,66 @@ def cmd_menu(cfg: dict) -> None:
     offset += 1
 
     print(f"  {offset})  Show recent events — ALL cameras (last 20)")
+    events_item = offset
     offset += 1
+
+    # ── Camera controls ───────────────────────────────────────────────────────
+    print()
+    print("  ── Privacy ──────────────────────────────────────────────────")
+    privacy_start = offset
+    for name in cam_names:
+        print(f"  {offset})  Privacy ON  — {name}")
+        offset += 1
+        print(f"  {offset})  Privacy OFF — {name}")
+        offset += 1
+
+    # Light — only cameras with has_light=True
+    light_cams = [n for n in cam_names if cameras.get(n, {}).get("has_light", False)]
+    light_start = offset
+    if light_cams:
+        print()
+        print("  ── Camera Light ─────────────────────────────────────────────")
+        for name in light_cams:
+            print(f"  {offset})  Light ON  — {name}")
+            offset += 1
+            print(f"  {offset})  Light OFF — {name}")
+            offset += 1
+
+    print()
+    print("  ── Notifications ────────────────────────────────────────────")
+    notif_start = offset
+    for name in cam_names:
+        print(f"  {offset})  Notifications ON  — {name}")
+        offset += 1
+        print(f"  {offset})  Notifications OFF — {name}")
+        offset += 1
+
+    # Pan — only cameras with pan_limit > 0
+    pan_cams = [n for n in cam_names if cameras.get(n, {}).get("pan_limit", 0) > 0]
+    pan_start = offset
+    pan_actions = [("left", "◀◀ Full left"), ("center", "■  Center (0°)"), ("right", "▶▶ Full right")]
+    if pan_cams:
+        print()
+        print("  ── Pan ──────────────────────────────────────────────────────")
+        for name in pan_cams:
+            for action_key, label in pan_actions:
+                lim = cameras[name].get("pan_limit", 120)
+                lim_str = f"-{lim}°" if action_key == "left" else (f"+{lim}°" if action_key == "right" else "0°")
+                print(f"  {offset})  Pan {label} ({lim_str}) — {name}")
+                offset += 1
+
+    print()
+    print("  ── Token ────────────────────────────────────────────────────")
+    token_item = offset
+    print(f"  {offset})  Show token status / renew")
+    offset += 1
+
+    print()
     print(f"  {offset})  Show config file")
+    config_item = offset
     offset += 1
     print(f"  {offset})  Re-scan cameras")
+    rescan_item = offset
     offset += 1
     print("  0)  Exit")
     print()
@@ -1382,13 +1787,14 @@ def cmd_menu(cfg: dict) -> None:
     choice = input("  Enter choice: ").strip()
 
     class A:
-        cam = None
-        limit = None
-        snaps_only = False
-        clips_only = False
+        cam    = None
+        action = None
+        limit  = None
+        snaps_only  = False
+        clips_only  = False
         re_download = False
         live = False
-        vlc = False
+        vlc  = False
 
     a = A()
     try:
@@ -1424,12 +1830,39 @@ def cmd_menu(cfg: dict) -> None:
         cmd_download(cfg, a)
     elif c == dl_start + len(cam_names):
         cmd_download(cfg, a)
-    elif c == dl_start + len(cam_names) + 1:
+    elif c == events_item:
         a.limit = 20
         cmd_events(cfg, a)
-    elif c == dl_start + len(cam_names) + 2:
+    # Privacy
+    elif privacy_start <= c < privacy_start + len(cam_names) * 2:
+        idx = c - privacy_start
+        a.cam    = cam_names[idx // 2]
+        a.action = "on" if idx % 2 == 0 else "off"
+        cmd_privacy(cfg, a)
+    # Light (only light_cams)
+    elif light_cams and light_start <= c < light_start + len(light_cams) * 2:
+        idx = c - light_start
+        a.cam    = light_cams[idx // 2]
+        a.action = "on" if idx % 2 == 0 else "off"
+        cmd_light(cfg, a)
+    # Notifications
+    elif notif_start <= c < notif_start + len(cam_names) * 2:
+        idx = c - notif_start
+        a.cam    = cam_names[idx // 2]
+        a.action = "on" if idx % 2 == 0 else "off"
+        cmd_notifications(cfg, a)
+    # Pan (only pan_cams)
+    elif pan_cams and pan_start <= c < pan_start + len(pan_cams) * len(pan_actions):
+        idx = c - pan_start
+        a.cam    = pan_cams[idx // len(pan_actions)]
+        a.action = pan_actions[idx % len(pan_actions)][0]
+        cmd_pan(cfg, a)
+    elif c == token_item:
+        a.action = "fix"
+        cmd_token(cfg, a)
+    elif c == config_item:
         cmd_config(cfg, a)
-    elif c == dl_start + len(cam_names) + 3:
+    elif c == rescan_item:
         cmd_rescan(cfg, a)
     else:
         print(f"  Unknown choice: {c}")
@@ -1448,8 +1881,11 @@ Commands:
   live     [name]      Open live stream (audio+video, ffplay by default)
   download [name]      Bulk download all events (JPEG + MP4)
   events   [name]      Show recent event list
-  privacy  [name] [on|off]  Show or toggle privacy mode (cloud API, no SHC needed)
-  light    [name]      Show camera light / illuminator status (cloud API)
+  privacy       [name] [on|off]  Show or toggle privacy mode (cloud API, no SHC needed)
+  light         [name] [on|off]  Show or toggle camera light manual override (cloud API)
+  notifications [name] [on|off]  Show or toggle push notifications (cloud API)
+  pan      [name] [left|center|right|<pos>]  Pan 360 camera (-120° to +120°)
+  token         [fix|browser]    Show token status; 'fix' renews silently or via browser
   config               Show current config file contents
   rescan               Re-discover cameras and update config
 
@@ -1498,10 +1934,13 @@ Run without arguments for the interactive menu.
         "stream":   cmd_live,
         "download": cmd_download,
         "events":   cmd_events,
-        "privacy":  cmd_privacy,
-        "light":    cmd_light,
-        "config":   cmd_config,
-        "rescan":   cmd_rescan,
+        "privacy":       cmd_privacy,
+        "light":         cmd_light,
+        "pan":           cmd_pan,
+        "notifications": cmd_notifications,
+        "token":         cmd_token,
+        "config":        cmd_config,
+        "rescan":        cmd_rescan,
     }
     if cmd not in dispatch:
         print(f"❌  Unknown command '{cmd}'. Run without arguments for the menu.")

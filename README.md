@@ -404,22 +404,64 @@ SSL:       Use verify=False — Bosch uses a private root CA not in the system s
 
 ### All Known Endpoints
 
+**Account / App**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/protocol_support?protocol=11&client=iphoneV2.11.2` | Protocol version check → `{"supportedProtocol": 11}` |
+| `GET` | `/v11/registration/check` | Logged-in user info: firstName, lastName, email, timeZone, tokenExpirationTime |
+| `GET` | `/v11/feature_flags` | Feature flags for the account |
+| `GET` | `/v11/purchases` | Subscription / purchase info |
+| `GET` | `/v11/contracts?locale=de_DE` | T&C + privacy URLs: tacVersion, tacURL, dpnVersion, dpnURL |
+
+**Camera — list & status**
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v11/video_inputs` | List all cameras (id, title, model, firmware, mac, privacyMode) |
-| `GET` | `/v11/video_inputs/{id}` | Single camera details |
+| `GET` | `/v11/video_inputs/{id}` | Single camera details (same shape as list entry) |
 | `GET` | `/v11/video_inputs/{id}/ping` | Returns `"ONLINE"` or `"OFFLINE"` |
-| `GET` | `/v11/video_inputs/{id}/firmware` | Firmware version info |
-| `GET` | `/v11/video_inputs/{id}/privacy` | Get privacy mode state (`{"privacyMode": "ON"/"OFF"}`) |
-| `PUT` | `/v11/video_inputs/{id}/privacy` | Set privacy mode (body: see below) |
+
+**Camera — live connection**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v11/video_inputs/{id}/commissioned` | Current live proxy connection info (same shape as `PUT /connection` response) — read-only, no session opened |
+| `PUT` | `/v11/video_inputs/{id}/connection` | Open live proxy connection (body: `{"type": "REMOTE"}` or `{"type": "LOCAL"}`) |
+
+**Camera — events**
+
+| Method | Path | Description |
+|--------|------|-------------|
 | `GET` | `/v11/events?videoInputId={id}` | All events for a camera |
 | `GET` | `/v11/events?videoInputId={id}&limit=N` | Limited event list |
 | `GET` | `{event.imageUrl}` | Download event JPEG snapshot |
 | `GET` | `{event.videoClipUrl}` | Download event MP4 clip |
-| `PUT` | `/v11/video_inputs/{id}/connection` | Open live proxy connection |
-| `GET` | `/v11/feature_flags` | Feature flags for the account |
-| `GET` | `/v11/purchases` | Subscription / purchase info |
-| `GET` | `/v11/contracts?locale=de_DE` | Contract info |
+
+**Camera — settings (read)**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v11/video_inputs/{id}/privacy` | Get privacy mode state → `{"privacyMode": "ON"/"OFF"}` |
+| `GET` | `/v11/video_inputs/{id}/firmware` | Returns T&C/privacy info (tacVersion, tacURL, dpnVersion, dpnURL) — label appears to be a Bosch API mislabel |
+| `GET` | `/v11/video_inputs/{id}/lighting_override` | Current manual light override state → `{"frontLightOn": bool, "wallwasherOn": bool}` |
+| `GET` | `/v11/video_inputs/{id}/lighting_options` | Light schedule options |
+| `GET` | `/v11/video_inputs/{id}/ambient_light_sensor_level` | Current ambient light sensor reading |
+| `GET` | `/v11/video_inputs/{id}/motion` | Motion detection settings |
+| `GET` | `/v11/video_inputs/{id}/motion_sensitive_areas` | Configured motion detection zones |
+| `GET` | `/v11/video_inputs/{id}/audioAlarm` | Audio alarm settings |
+| `GET` | `/v11/video_inputs/{id}/recording_options` | Recording settings |
+| `GET` | `/v11/video_inputs/{id}/timestamp` | Camera timestamp / clock info |
+| `GET` | `/v11/video_inputs/{id}/rules` | Automation rules (returns `[]` when none configured) |
+| `GET` | `/v11/video_inputs/{id}/wifiinfo` | WiFi info — returns **HTTP 401** (requires different/elevated auth) |
+
+**Camera — settings (write)**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/v11/video_inputs/{id}/privacy` | Set privacy mode → HTTP 204 on success |
+| `PUT` | `/v11/video_inputs/{id}/lighting_override` | Set manual light override → HTTP 204 on success |
+| `PUT` | `/v11/video_inputs/{id}/enable_notifications` | Set notification schedule → HTTP 204 on success |
 
 ### Privacy Mode
 
@@ -435,6 +477,27 @@ Content-Type: application/json
 
 Also available from the `GET /v11/video_inputs` response — each camera object includes
 a top-level `"privacyMode"` field, so no extra poll is needed for status.
+
+### Camera Light Override
+
+Manual light override state can be read and set directly via the cloud API:
+
+```
+GET  /v11/video_inputs/{id}/lighting_override
+→ {"frontLightOn": false, "wallwasherOn": false}
+
+PUT  /v11/video_inputs/{id}/lighting_override
+Content-Type: application/json
+
+# Turn on:
+{"frontLightOn": true, "wallwasherOn": true, "frontLightIntensity": 1.0}
+
+# Turn off:
+{"frontLightOn": false, "wallwasherOn": false}
+→ HTTP 204 No Content on success
+```
+
+Light schedule options (read-only) are available via `GET /v11/video_inputs/{id}/lighting_options`.
 
 ### Camera Light Schedule (read-only via cloud API)
 
@@ -454,8 +517,23 @@ The camera light schedule state is included in `GET /v11/video_inputs` per camer
 ```
 
 `featureSupport.light` (boolean) indicates whether the camera has a built-in LED indicator.
-**Light write control is not available via the cloud API** — no endpoint found for toggling
-the indicator LED. Control requires the SHC local API (mutual TLS, `PUT .../CameraLight/state`).
+
+### Notifications
+
+```
+PUT  /v11/video_inputs/{id}/enable_notifications
+Content-Type: application/json
+
+# Disable all notifications:
+{"enabledNotificationsStatus": "ALWAYS_OFF"}
+
+# Follow the camera schedule:
+{"enabledNotificationsStatus": "FOLLOW_CAMERA_SCHEDULE"}
+→ HTTP 204 No Content on success
+```
+
+Current notification state is available in the `GET /v11/video_inputs` response as
+`notificationsEnabledStatus` per camera (e.g. `"ON_CAMERA_SCHEDULE"`, `"ALWAYS_OFF"`).
 
 ### Live Proxy Endpoints (after PUT /connection)
 
@@ -584,9 +662,9 @@ tool/
   There is no documented local API on the SHC for camera images.
 - **VLC needs ffmpeg** — the `live --vlc` option requires ffmpeg to proxy the stream,
   because VLC cannot skip TLS certificate verification for `rtsps://`.
-- **Camera light control** — the `light` command is read-only (shows schedule status
-  from cloud API). No cloud endpoint found for toggling the LED indicator.
-  Write control requires the SHC local API with mutual TLS.
+- **Camera light control** — the `light` command shows schedule status from the cloud API.
+  Manual light override (on/off) is writable via `PUT /v11/video_inputs/{id}/lighting_override`.
+  Full schedule control requires the SHC local API with mutual TLS.
 
 ---
 
