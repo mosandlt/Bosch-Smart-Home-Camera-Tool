@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.5.0"
+VERSION     = "1.6.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1798,6 +1798,314 @@ def cmd_notifications(cfg: dict, args) -> None:
             print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
 
 
+def cmd_watch(cfg: dict, args) -> None:
+    """
+    Watch for new camera events by polling GET /v11/events every N seconds.
+
+    Usage:
+      python3 bosch_camera.py watch [<cam-name>] [--interval N] [--duration N]
+
+    Polls every --interval seconds (default 30). Runs until Ctrl+C or --duration
+    seconds elapsed. Prints each new event with type, timestamp, image URL and
+    clip URL.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    interval = getattr(args, "interval", 30) or 30
+    duration = getattr(args, "duration", 0) or 0
+
+    # Build initial baseline of seen event IDs per camera
+    last_seen: dict[str, str] = {}
+    print(f"\n  Fetching baseline events...")
+    for name, cam_info in cams.items():
+        events = api_get_events(session, cam_info["id"], limit=1)
+        if events:
+            last_seen[name] = events[0].get("id", "")
+        else:
+            last_seen[name] = ""
+        print(f"  {name}: baseline event id = {last_seen[name] or '(none)'}")
+
+    n_cams = len(cams)
+    print(f"\nWatching {n_cams} camera(s)... (Ctrl+C to stop)")
+    if duration:
+        print(f"  Will stop after {duration}s.")
+    print(f"  Polling every {interval}s.\n")
+
+    start_time = time.time()
+    total_new  = 0
+
+    def _renew_session() -> tuple[str, requests.Session]:
+        t = get_token(cfg)
+        s = make_session(t)
+        return t, s
+
+    try:
+        while True:
+            if duration and (time.time() - start_time) >= duration:
+                print(f"\n  Duration of {duration}s reached — stopping.")
+                break
+
+            time.sleep(interval)
+
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+            for name, cam_info in cams.items():
+                cam_id  = cam_info["id"]
+
+                # Fetch latest events; retry once on 401
+                try:
+                    events = api_get_events(session, cam_id, limit=20)
+                except Exception:
+                    events = []
+
+                if not events and session.headers.get("Authorization", ""):
+                    # Possibly 401 — try renewing
+                    try:
+                        token, session = _renew_session()
+                        events = api_get_events(session, cam_id, limit=20)
+                    except Exception:
+                        events = []
+
+                baseline = last_seen.get(name, "")
+                new_events = []
+                for ev in events:
+                    ev_id = ev.get("id", "")
+                    if ev_id == baseline:
+                        break
+                    new_events.append(ev)
+
+                # Print new events (oldest first — events list is newest-first)
+                for ev in reversed(new_events):
+                    etype     = ev.get("eventType", "EVENT")
+                    ts        = ev.get("timestamp", "")[:19]
+                    img_url   = ev.get("imageUrl", "")
+                    clip_url  = ev.get("videoClipUrl", "")
+                    type_icon = "🔊" if "AUDIO" in etype else "🚨"
+                    print(f"  [{now_str}] {type_icon} {etype:<15s}  cam={name:<12s}  {ts}")
+                    if img_url:
+                        print(f"             📸 {img_url}")
+                    if clip_url:
+                        print(f"             🎬 {clip_url}")
+                    total_new += 1
+
+                if new_events:
+                    last_seen[name] = new_events[0].get("id", baseline)
+
+    except KeyboardInterrupt:
+        elapsed = int(time.time() - start_time)
+        print(f"\n\n  Stopped after {elapsed}s. Total new events seen: {total_new}")
+
+
+def cmd_motion(cfg: dict, args) -> None:
+    """
+    Get or set motion detection settings.
+
+    Usage:
+      python3 bosch_camera.py motion [<cam>]                    # show current
+      python3 bosch_camera.py motion [<cam>] --enable           # enable motion
+      python3 bosch_camera.py motion [<cam>] --disable          # disable motion
+      python3 bosch_camera.py motion [<cam>] --sensitivity S    # set sensitivity
+        Sensitivity values: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH
+
+    API: GET/PUT /v11/video_inputs/{id}/motion
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    enable  = getattr(args, "enable", False)
+    disable = getattr(args, "disable", False)
+    sensitivity = getattr(args, "sensitivity", None)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Motion Detection: {name} ──────────────────────────────────")
+
+        # GET current settings
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch motion settings: HTTP {r.status_code}")
+            continue
+        data    = r.json()
+        current_enabled  = data.get("enabled", False)
+        current_sens     = data.get("motionAlarmConfiguration", data.get("sensitivity", "UNKNOWN"))
+
+        enabled_str = "ENABLED" if current_enabled else "DISABLED"
+        icon        = "✅" if current_enabled else "❌"
+        print(f"  {icon}  Motion: {enabled_str}  Sensitivity: {current_sens}")
+
+        if not enable and not disable and not sensitivity:
+            print(f"\n  Run with --enable / --disable / --sensitivity to change.")
+            print(f"  E.g.: python3 bosch_camera.py motion {name.lower()} --enable --sensitivity SUPER_HIGH")
+            continue
+
+        # Build PUT body
+        new_enabled = current_enabled
+        new_sens    = current_sens
+        if enable:
+            new_enabled = True
+        if disable:
+            new_enabled = False
+        if sensitivity:
+            new_sens    = sensitivity
+            new_enabled = True  # enabling implicitly when setting sensitivity
+
+        body = {"enabled": new_enabled, "motionAlarmConfiguration": new_sens}
+        print(f"  🔄  Setting motion → enabled={new_enabled}  sensitivity={new_sens}...")
+
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            state_str = "ENABLED" if new_enabled else "DISABLED"
+            icon_new  = "✅" if new_enabled else "❌"
+            print(f"  {icon_new}  Motion {state_str}  Sensitivity: {new_sens}")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_audio_alarm(cfg: dict, args) -> None:
+    """
+    Get or set audio alarm detection settings.
+
+    Usage:
+      python3 bosch_camera.py audio-alarm [<cam>]               # show current
+      python3 bosch_camera.py audio-alarm [<cam>] --enable      # enable
+      python3 bosch_camera.py audio-alarm [<cam>] --disable     # disable
+      python3 bosch_camera.py audio-alarm [<cam>] --threshold N # set threshold 0-100
+
+    API: GET/PUT /v11/video_inputs/{id}/audioAlarm
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    enable    = getattr(args, "enable", False)
+    disable   = getattr(args, "disable", False)
+    threshold = getattr(args, "threshold", None)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Audio Alarm: {name} ──────────────────────────────────────")
+
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/audioAlarm", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch audio alarm settings: HTTP {r.status_code}")
+            continue
+        data              = r.json()
+        current_enabled   = data.get("enabled", False)
+        current_threshold = data.get("threshold", 80)
+
+        enabled_str = "ENABLED" if current_enabled else "DISABLED"
+        icon        = "🔊" if current_enabled else "🔕"
+        print(f"  {icon}  Audio Alarm: {enabled_str}  Threshold: {current_threshold}")
+
+        if not enable and not disable and threshold is None:
+            print(f"\n  Run with --enable / --disable / --threshold to change.")
+            print(f"  E.g.: python3 bosch_camera.py audio-alarm {name.lower()} --enable --threshold 60")
+            continue
+
+        new_enabled   = current_enabled
+        new_threshold = current_threshold
+        if enable:
+            new_enabled = True
+        if disable:
+            new_enabled = False
+        if threshold is not None:
+            new_threshold = threshold
+
+        body = {"enabled": new_enabled, "threshold": new_threshold}
+        print(f"  🔄  Setting audio alarm → enabled={new_enabled}  threshold={new_threshold}...")
+
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/audioAlarm",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            state_str = "ENABLED" if new_enabled else "DISABLED"
+            icon_new  = "🔊" if new_enabled else "🔕"
+            print(f"  {icon_new}  Audio Alarm {state_str}  Threshold: {new_threshold}")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_recording(cfg: dict, args) -> None:
+    """
+    Get or set cloud recording options.
+
+    Usage:
+      python3 bosch_camera.py recording [<cam>]                 # show current
+      python3 bosch_camera.py recording [<cam>] --sound-on      # include audio
+      python3 bosch_camera.py recording [<cam>] --sound-off     # exclude audio
+
+    API: GET/PUT /v11/video_inputs/{id}/recording_options
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    sound_on  = getattr(args, "sound_on",  False)
+    sound_off = getattr(args, "sound_off", False)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Recording Options: {name} ──────────────────────────────────")
+
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/recording_options", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch recording options: HTTP {r.status_code}")
+            continue
+        data          = r.json()
+        current_sound = data.get("recordSound", False)
+
+        sound_str = "ON" if current_sound else "OFF"
+        icon      = "🔊" if current_sound else "🔇"
+        print(f"  {icon}  Record Sound: {sound_str}")
+
+        if not sound_on and not sound_off:
+            print(f"\n  Run with --sound-on or --sound-off to change.")
+            print(f"  E.g.: python3 bosch_camera.py recording {name.lower()} --sound-on")
+            continue
+
+        new_sound = current_sound
+        if sound_on:
+            new_sound = True
+        if sound_off:
+            new_sound = False
+
+        body = {"recordSound": new_sound}
+        print(f"  🔄  Setting recordSound → {new_sound}...")
+
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/recording_options",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            state_str = "ON" if new_sound else "OFF"
+            icon_new  = "🔊" if new_sound else "🔇"
+            print(f"  {icon_new}  Record Sound: {state_str}")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
 # ══════════════════════════ RCP PROTOCOL ══════════════════════════════════════
 #
 # RCP (Remote Configuration Protocol) is Bosch's proprietary binary protocol
@@ -3196,6 +3504,118 @@ def main():
         epilog="  Example:\n    python3 bosch_camera.py rescan",
     )
 
+    # ── watch ──────────────────────────────────────────────────────────────────
+    p_watch = subparsers.add_parser(
+        "watch",
+        help="Poll for new events in real-time",
+        description=(
+            "👁️   watch — Poll for new camera events in real-time\n"
+            "\n"
+            "  Polls GET /v11/events every N seconds (default 30) and prints\n"
+            "  any new events as they arrive. Runs until Ctrl+C or --duration\n"
+            "  seconds elapsed.\n"
+            "\n"
+            "  Each new event shows: time, type (MOVEMENT / AUDIO_ALARM),\n"
+            "  camera name, timestamp, snapshot URL, and clip URL."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py watch\n"
+            "    python3 bosch_camera.py watch Garten\n"
+            "    python3 bosch_camera.py watch Garten --interval 15\n"
+            "    python3 bosch_camera.py watch --duration 600"
+        ),
+    )
+    p_watch.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
+    p_watch.add_argument("--interval", type=int, default=30, metavar="N",
+                         help="Poll interval in seconds (default: 30)")
+    p_watch.add_argument("--duration", type=int, default=0, metavar="N",
+                         help="Stop after N seconds (default: 0 = infinite)")
+
+    # ── motion ─────────────────────────────────────────────────────────────────
+    p_motion = subparsers.add_parser(
+        "motion",
+        help="Get/set motion detection settings",
+        description=(
+            "🏃  motion — Get or set motion detection settings\n"
+            "\n"
+            "  Reads or writes the motion detection configuration.\n"
+            "  API: GET/PUT /v11/video_inputs/{id}/motion\n"
+            "\n"
+            "  Sensitivity values: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py motion Garten\n"
+            "    python3 bosch_camera.py motion Garten --enable\n"
+            "    python3 bosch_camera.py motion Garten --disable\n"
+            "    python3 bosch_camera.py motion Garten --enable --sensitivity SUPER_HIGH\n"
+            "    python3 bosch_camera.py motion Garten --sensitivity MEDIUM"
+        ),
+    )
+    p_motion.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
+    p_motion.add_argument("--enable",  action="store_true", help="Enable motion detection")
+    p_motion.add_argument("--disable", action="store_true", help="Disable motion detection")
+    p_motion.add_argument("--sensitivity",
+                          choices=["OFF", "LOW", "MEDIUM", "HIGH", "SUPER_HIGH"],
+                          metavar="S",
+                          help="Sensitivity: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH")
+
+    # ── audio-alarm ────────────────────────────────────────────────────────────
+    p_audio = subparsers.add_parser(
+        "audio-alarm",
+        help="Get/set audio alarm detection settings",
+        description=(
+            "🔊  audio-alarm — Get or set audio alarm detection settings\n"
+            "\n"
+            "  Reads or writes the audio alarm configuration.\n"
+            "  API: GET/PUT /v11/video_inputs/{id}/audioAlarm\n"
+            "\n"
+            "  Threshold is 0-100 (higher = less sensitive)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py audio-alarm Garten\n"
+            "    python3 bosch_camera.py audio-alarm Garten --enable\n"
+            "    python3 bosch_camera.py audio-alarm Garten --disable\n"
+            "    python3 bosch_camera.py audio-alarm Garten --enable --threshold 60"
+        ),
+    )
+    p_audio.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
+    p_audio.add_argument("--enable",    action="store_true", help="Enable audio alarm")
+    p_audio.add_argument("--disable",   action="store_true", help="Disable audio alarm")
+    p_audio.add_argument("--threshold", type=int, metavar="N",
+                         help="Detection threshold 0-100 (higher = less sensitive)")
+
+    # ── recording ──────────────────────────────────────────────────────────────
+    p_rec = subparsers.add_parser(
+        "recording",
+        help="Get/set cloud recording options (sound on/off)",
+        description=(
+            "🎬  recording — Get or set cloud recording options\n"
+            "\n"
+            "  Reads or writes the recording configuration.\n"
+            "  API: GET/PUT /v11/video_inputs/{id}/recording_options\n"
+            "\n"
+            "  Controls whether audio is included in cloud-stored recordings."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py recording Garten\n"
+            "    python3 bosch_camera.py recording Garten --sound-on\n"
+            "    python3 bosch_camera.py recording Garten --sound-off"
+        ),
+    )
+    p_rec.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
+    p_rec.add_argument("--sound-on",  action="store_true", dest="sound_on",
+                       help="Enable sound recording")
+    p_rec.add_argument("--sound-off", action="store_true", dest="sound_off",
+                       help="Disable sound recording")
+
     # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -3205,6 +3625,9 @@ def main():
         cam=None, action=None, sub=None, limit=None,
         snaps_only=False, clips_only=False, re_download=False,
         live=False, vlc=False, full=False, minutes=None,
+        interval=30, duration=0,
+        enable=False, disable=False, sensitivity=None,
+        threshold=None, sound_on=False, sound_off=False,
     )
     for _k, _v in _defaults.items():
         if not hasattr(args, _k):
@@ -3246,6 +3669,10 @@ def main():
         "light":         cmd_light,
         "pan":           cmd_pan,
         "notifications": cmd_notifications,
+        "watch":         cmd_watch,
+        "motion":        cmd_motion,
+        "audio-alarm":   cmd_audio_alarm,
+        "recording":     cmd_recording,
         "rcp":           cmd_rcp,
         "token":         cmd_token,
         "config":        cmd_config,
