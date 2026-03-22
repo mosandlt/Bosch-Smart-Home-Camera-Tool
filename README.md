@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, and RCP protocol reads — all from the command line.
-> No official API. No app needed after setup. **v1.4.0**
+> No official API. No app needed after setup. **v1.5.0**
 
 ---
 
@@ -51,6 +51,8 @@ of Bosch's software was distributed. Only network protocol observations were use
 | Live snapshot — current image, ~1.5 s | `liveshot` |
 | **Live stream — 30fps H.264 + AAC audio** | `live` |
 | Live stream in VLC | `live --vlc` |
+| Live stream — high quality | `live --hq` |
+| Live stream — select instance | `live --inst N` |
 | Download all events (JPEG + MP4) | `download` |
 | Recent event list | `events` |
 | **Privacy mode — get/set via cloud API** | `privacy [cam] [on\|off]` |
@@ -128,10 +130,13 @@ python3 bosch_camera.py info --full        # also fetch firmware, motion, audio,
 python3 bosch_camera.py snapshot Outdoor          # latest motion-triggered JPEG
 python3 bosch_camera.py liveshot Outdoor          # current live image (~1.5s)
 python3 bosch_camera.py snapshot --live           # all cameras, live
+python3 bosch_camera.py liveshot Outdoor --hq     # high-quality live snapshot
 
 # Live stream — 30fps H.264 + AAC audio
 python3 bosch_camera.py live Outdoor              # opens in ffplay
 python3 bosch_camera.py live Outdoor --vlc        # opens in VLC
+python3 bosch_camera.py live Outdoor --hq         # request high-quality (highest bitrate tier)
+python3 bosch_camera.py live Outdoor --inst 1     # use stream instance 1 instead of 2
 
 # Download events
 python3 bosch_camera.py download                  # all cameras
@@ -180,6 +185,7 @@ python3 bosch_camera.py rcp Outdoor services     # network services list
 python3 bosch_camera.py rcp Outdoor frame        # raw video frame 320x180 YUV422 -> JPEG
 python3 bosch_camera.py rcp Outdoor script       # IVA automation script (gzip -> text)
 python3 bosch_camera.py rcp Outdoor iva          # IVA rule types + resiMotion config
+python3 bosch_camera.py rcp Outdoor bitrate      # bitrate ladder tiers in kbps
 python3 bosch_camera.py rcp Outdoor all          # run all RCP reads
 
 # Token
@@ -191,6 +197,16 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.5.0
+
+- **Streaming stability fix**: `maxSessionDuration` changed from 60 → 3600 seconds — prevents forced stream reconnection every 60 s
+- **`--hq` flag for `live`**: pass `highQualityVideo: true` in `PUT /connection` to request the highest bitrate tier
+- **`--hq` flag for `snapshot` / `liveshot`**: same high-quality flag for proxy live snapshots
+- **`--inst N` flag for `live`**: select the RTSPS stream instance in the URL (default 2; use 1 for the alternative stream)
+- **`rcp bitrate` subcommand**: reads the camera's bitrate ladder (0x0c81) and displays all tiers in kbps/Mbps; included in `rcp all`
 
 ---
 

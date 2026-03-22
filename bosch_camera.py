@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.4.0"
+VERSION     = "1.5.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -526,12 +526,13 @@ def cmd_events(cfg: dict, args) -> None:
 
 # ══════════════════════════ LIVE SNAPSHOT METHODS ═══════════════════════════
 
-def snap_from_proxy(cam_info: dict, token: str) -> bytes | None:
+def snap_from_proxy(cam_info: dict, token: str, hq: bool = False) -> bytes | None:
     """
     Live snapshot via PUT /connection.
     Tries LOCAL first (faster on home network), then REMOTE (cloud proxy).
     If snap.jpg returns 404 (proxy session expired), automatically re-requests
     a fresh connection and retries once.
+    hq=True requests highQualityVideo in the connection payload.
     Returns JPEG bytes or None.
     """
     cam_id  = cam_info.get("id", "")
@@ -542,7 +543,7 @@ def snap_from_proxy(cam_info: dict, token: str) -> bytes | None:
         print(f"  🌐  Opening {label} connection...")
         r = requests.put(
             f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
-            headers=headers, json={"type": conn_type, "highQualityVideo": False}, verify=False, timeout=15,
+            headers=headers, json={"type": conn_type, "highQualityVideo": hq}, verify=False, timeout=15,
         )
         if r.status_code != 200:
             return None
@@ -569,7 +570,7 @@ def snap_from_proxy(cam_info: dict, token: str) -> bytes | None:
             # Retry once with a fresh connection
             r2 = requests.put(
                 f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
-                headers=headers, json={"type": conn_type, "highQualityVideo": False}, verify=False, timeout=15,
+                headers=headers, json={"type": conn_type, "highQualityVideo": hq}, verify=False, timeout=15,
             )
             if r2.status_code == 200:
                 data2     = r2.json()
@@ -689,6 +690,7 @@ def cmd_snapshot(cfg: dict, args) -> None:
                       1. Cloud proxy live snap (if live connection previously opened)
                       2. Local camera snap.jpg (if local_ip + credentials in config)
                       3. Latest event snapshot (fallback)
+    --hq: request highQualityVideo=true in PUT /connection (higher resolution).
     """
     token   = get_token(cfg)
     session = make_session(token)
@@ -696,6 +698,7 @@ def cmd_snapshot(cfg: dict, args) -> None:
     cameras = get_cameras(cfg, session)
     cams    = resolve_cam(cfg, getattr(args, "cam", None))
     live    = getattr(args, "live", False)
+    hq      = getattr(args, "hq", False)
 
     for name, cam_info in cams.items():
         mode_str = "Live Snapshot" if live else "Latest Event Snapshot"
@@ -703,7 +706,7 @@ def cmd_snapshot(cfg: dict, args) -> None:
 
         if live:
             # ── Method 1: Cloud proxy live snap ───────────────────────────────
-            data = snap_from_proxy(cam_info, token)
+            data = snap_from_proxy(cam_info, token, hq=hq)
             if data:
                 _save_and_open(data, name, "", "proxy_live")
                 continue
@@ -1075,11 +1078,17 @@ def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "
 
 
 def cmd_live(cfg: dict, args) -> None:
-    """Open live stream — tries PUT /connection → open VLC on success."""
+    """Open live stream — tries PUT /connection → open VLC on success.
+
+    --hq: request highQualityVideo=true in PUT /connection (higher bitrate stream).
+    --inst N: select stream instance (default 2; use 1 for alternative stream).
+    """
     token   = get_token(cfg)
     session = make_session(token)
     cameras = get_cameras(cfg, session)
     cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    hq      = getattr(args, "hq", False)
+    inst    = getattr(args, "inst", 2)
 
     for name, cam_info in cams.items():
         print(f"\n── Live Stream: {name} ──────────────────────────────────────")
@@ -1100,7 +1109,7 @@ def cmd_live(cfg: dict, args) -> None:
         for type_val in ["REMOTE", "LOCAL"]:
             r = session.put(
                 url,
-                json={"type": type_val, "highQualityVideo": False},
+                json={"type": type_val, "highQualityVideo": hq},
                 headers={"Content-Type": "application/json"},
                 timeout=15,
             )
@@ -1142,7 +1151,7 @@ def cmd_live(cfg: dict, args) -> None:
                 proxy_host = host_port.split(":")[0]
                 rtsps_url = (
                     f"rtsps://{proxy_host}:443/{hash_path}"
-                    f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60"
+                    f"/rtsp_tunnel?inst={inst}&enableaudio=1&fmtp=1&maxSessionDuration=3600"
                 )
                 print(f"  📡  RTSPS URL: {rtsps_url}")
                 _open_rtsps_stream(rtsps_url, name, proxy_url, use_vlc=getattr(args, "vlc", False))
@@ -1282,7 +1291,7 @@ def cmd_info(cfg: dict, args) -> None:
                     hash_path  = u.split("/", 1)[1]
                     snap_url   = sd.get("imageUrlScheme", "https://{url}/snap.jpg").replace("{url}", u)
                     rtsps_url  = (f"rtsps://{proxy_host}:443/{hash_path}"
-                                  f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60")
+                                  f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=3600")
                     print(f"      Snap URL:      {snap_url}")
                     print(f"      RTSPS URL:     {rtsps_url}")
                     print(f"      Stream:        H.264 1920×1080 30fps + AAC 16kHz (session ~60s)")
@@ -2048,6 +2057,7 @@ def cmd_rcp(cfg: dict, args) -> None:
       frame     — raw video frame 320x180 YUV422 (0x0c98) → JPEG
       script    — IVA automation script gzip (0x09f3) → text
       iva       — IVA rule types + resiMotion config (0x0ba9 + 0x0a1b)
+      bitrate   — bitrate ladder tiers in kbps (0x0c81)
       all       — run all of the above
 
     The cloud proxy hash acts as the credential — no username/password needed.
@@ -2061,13 +2071,13 @@ def cmd_rcp(cfg: dict, args) -> None:
 
     # Allow "rcp info" without a camera name (sub parsed as cam_arg)
     RCP_SUBS = ("info", "clock", "snapshot", "alarms", "privacy",
-                "dimmer", "motion", "services", "frame", "script", "iva", "all")
+                "dimmer", "motion", "services", "frame", "script", "iva", "bitrate", "all")
     if cam_arg and cam_arg.lower() in RCP_SUBS and not sub:
         sub, cam_arg = cam_arg.lower(), None
 
     if not sub:
         print("\n  ℹ️   Usage: python3 bosch_camera.py rcp [camera] <subcommand>")
-        print("  Subcommands: info | clock | snapshot | alarms | privacy | dimmer | motion | services | frame | script | iva | all")
+        print("  Subcommands: info | clock | snapshot | alarms | privacy | dimmer | motion | services | frame | script | iva | bitrate | all")
         return
 
     cams = resolve_cam(cfg, cam_arg)
@@ -2315,6 +2325,24 @@ def cmd_rcp(cfg: dict, args) -> None:
                     print(f"  resiMotion raw: {len(d):,} bytes  {d[:32].hex()}")
             else:
                 print(f"  resiMotion config: (not available)")
+
+        # ── bitrate ───────────────────────────────────────────────────────────────
+        if sub in ("bitrate", "all"):
+            print(f"\n  ── Bitrate Ladder (0x0c81) ───────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c81", sessionid)
+            if d and len(d) >= 4:
+                import struct as _s
+                # Ladder is a series of big-endian uint32 values (kbps)
+                n = len(d) // 4
+                tiers = [_s.unpack(">I", d[i*4:(i+1)*4])[0] for i in range(n)]
+                labels = ["low", "medium-low", "medium", "medium-high", "high"]
+                for i, kbps in enumerate(tiers):
+                    label = labels[i] if i < len(labels) else f"tier{i}"
+                    marker = " ←" if i == len(tiers)-1 else ""
+                    print(f"  [{label}]  {kbps:,} kbps  ({kbps//1000:.1f} Mbps){marker}")
+                print(f"\n  Note: highQualityVideo=true selects the highest tier")
+            else:
+                print(f"  Bitrate: (not available)")
 
         print()
 
@@ -2715,6 +2743,11 @@ def main():
         action="store_true",
         help="Prefer live snapshot methods (cloud proxy or local LAN) over event snapshot",
     )
+    p_snap.add_argument(
+        "--hq",
+        action="store_true",
+        help="Request highQualityVideo=true in PUT /connection (higher resolution)",
+    )
 
     # ── liveshot aliases ───────────────────────────────────────────────────────
     for _alias in ("liveshot", "livesnap", "live-snapshot"):
@@ -2766,6 +2799,18 @@ def main():
         action="store_true",
         help="Open in VLC via ffmpeg pipe instead of ffplay (macOS only)",
     )
+    p_live.add_argument(
+        "--hq",
+        action="store_true",
+        help="Request highQualityVideo=true in PUT /connection (higher bitrate stream)",
+    )
+    p_live.add_argument(
+        "--inst",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Stream instance number in RTSPS URL (default: 2)",
+    )
 
     # stream alias
     p_stream = subparsers.add_parser(
@@ -2778,6 +2823,10 @@ def main():
                           help="Camera name or partial match")
     p_stream.add_argument("--vlc", action="store_true",
                           help="Open in VLC via ffmpeg pipe instead of ffplay")
+    p_stream.add_argument("--hq", action="store_true",
+                          help="Request highQualityVideo=true in PUT /connection")
+    p_stream.add_argument("--inst", type=int, default=2, metavar="N",
+                          help="Stream instance number in RTSPS URL (default: 2)")
 
     # ── download ───────────────────────────────────────────────────────────────
     p_dl = subparsers.add_parser(
@@ -3082,7 +3131,7 @@ def main():
     # ── rcp ────────────────────────────────────────────────────────────────────
     p_rcp = subparsers.add_parser(
         "rcp",
-        help="RCP protocol reads via cloud proxy (info, clock, snapshot, alarms, ...)",
+        help="RCP protocol reads via cloud proxy (info, clock, snapshot, alarms, bitrate, ...)",
         description=(
             "🔌  rcp — Remote Configuration Protocol reads via cloud proxy\n"
             "\n"
@@ -3105,6 +3154,7 @@ def main():
             "    frame     — raw video frame (0x0c98, 320x180 YUV422 -> JPEG)\n"
             "    script    — IVA automation script (0x09f3, gzip -> text)\n"
             "    iva       — IVA rule types + resiMotion config (0x0ba9 + 0x0a1b)\n"
+            "    bitrate   — bitrate ladder tiers in kbps (0x0c81)\n"
             "    all       — run all of the above"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3114,6 +3164,7 @@ def main():
             "    python3 bosch_camera.py rcp Garten info\n"
             "    python3 bosch_camera.py rcp Kamera clock\n"
             "    python3 bosch_camera.py rcp Garten snapshot\n"
+            "    python3 bosch_camera.py rcp Garten bitrate\n"
             "    python3 bosch_camera.py rcp all\n"
             "    python3 bosch_camera.py rcp Garten all"
         ),
@@ -3127,7 +3178,7 @@ def main():
     p_rcp.add_argument(
         "sub",
         nargs="?",
-        metavar="info|clock|snapshot|alarms|privacy|dimmer|motion|services|frame|script|iva|all",
+        metavar="info|clock|snapshot|alarms|privacy|dimmer|motion|services|frame|script|iva|bitrate|all",
         help="RCP subcommand to run",
     )
 
