@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v1.8.0**
+> No official API. No app needed after setup. **v1.9.0**
 
 ---
 
@@ -229,6 +229,21 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.9.0
+
+**Push notification architecture documented**
+APK analysis of the official Bosch Smart Camera app (v2.3.3) revealed the complete push notification architecture:
+
+- **Firebase project**: `bosch-smart-cameras` (GCM Sender ID `404630424405`)
+- **Android push flow**: Camera → CBS cloud → Firebase FCM → `NMFcmMessagingService.onMessageReceived()` → app polls `GET /v11/events`
+- **iOS push flow**: Camera → CBS cloud → Apple APNs (binary TCP, port 5223/443)
+- **No WebSocket / SSE**: The CBS cloud API has no server-push mechanism. All event detection relies on polling `GET /v11/events`.
+
+**`watch` command background**
+The `watch` command polls `GET /v11/events` every 30 s and prints new events as they arrive — this is the same mechanism the official app uses after receiving an FCM push. The FCM push itself is only available to registered app instances; the `watch` command is the equivalent for scripts.
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bosch Smart Home Camera — All-in-one Standalone Tool
-Version: 1.8.0
+Version: 1.9.0
 =====================================================
 No hardcoded camera IDs or credentials.
 All configuration is stored in bosch_config.json (created on first run).
@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.8.0"
+VERSION     = "1.9.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
