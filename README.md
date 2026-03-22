@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, and RCP protocol reads — all from the command line.
-> No official API. No app needed after setup. **v1.3.0**
+> No official API. No app needed after setup. **v1.4.0**
 
 ---
 
@@ -177,6 +177,9 @@ python3 bosch_camera.py rcp Outdoor privacy      # privacy mask state read
 python3 bosch_camera.py rcp Outdoor dimmer       # LED dimmer value 0-100
 python3 bosch_camera.py rcp Outdoor motion       # motion zone count + coordinates
 python3 bosch_camera.py rcp Outdoor services     # network services list
+python3 bosch_camera.py rcp Outdoor frame        # raw video frame 320x180 YUV422 -> JPEG
+python3 bosch_camera.py rcp Outdoor script       # IVA automation script (gzip -> text)
+python3 bosch_camera.py rcp Outdoor iva          # IVA rule types + resiMotion config
 python3 bosch_camera.py rcp Outdoor all          # run all RCP reads
 
 # Token
@@ -188,6 +191,15 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.4.0
+
+- New `rcp frame` subcommand: fetches a live 320×180 YUV422 raw video frame (0x0c98, 115,200 bytes) directly via RCP, converts to JPEG using numpy + Pillow (falls back to raw `.yuv` if not installed)
+- New `rcp script` subcommand: fetches the gzip-compressed IVA automation script (0x09f3), decompresses it, and prints the Bosch IVA scripting language source
+- New `rcp iva` subcommand: reads IVA rule type names (0x0ba9, null-separated ASCII list) and the resiMotion motion detection config (0x0a1b, polygon coordinates + sensitivity params)
+- All 3 new subcommands included in `rcp all`
 
 ---
 
@@ -452,6 +464,10 @@ auth level 5 (service account), which is not accessible via the cloud proxy.
 | `0x0c0a` | P_OCTET | Motion zones (8 bytes each: x1 y1 x2 y2 in 0-10000 coords) |
 | `0x0c38` | P_OCTET | Alarm catalog (UTF-16-BE encoded string list) |
 | `0x0c62` | P_OCTET | Network services list (null-separated ASCII) |
+| `0x0c98` | P_OCTET | Live raw video frame 320×180 YUV422 (115,200 bytes) |
+| `0x09f3` | P_OCTET | IVA automation script (gzip-compressed Bosch scripting language) |
+| `0x0ba9` | P_OCTET | IVA rule type names (null-separated ASCII: "Object in field", etc.) |
+| `0x0a1b` | P_OCTET | resiMotion config (polygon coordinates + sensitivity parameters) |
 
 **Note:** The `rcp snapshot` subcommand (0x099e) returns a small 160×90 JPEG
 thumbnail directly from the camera's firmware — distinct from the cloud proxy
