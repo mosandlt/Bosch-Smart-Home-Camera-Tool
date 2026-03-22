@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v1.7.0**
+> No official API. No app needed after setup. **v1.8.0**
 
 ---
 
@@ -61,7 +61,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Push notifications — on/off** | `notifications [cam] [on\|off]` |
 | **Pan 360 camera** | `pan [cam] [left\|center\|right\|<-120..120>]` |
 | **RCP reads via cloud proxy** | `rcp [cam] <info\|clock\|snapshot\|alarms\|...>` |
-| **Real-time event watching** | `watch [cam] [--interval N] [--duration N]` |
+| **Real-time event watching** | `watch [cam] [--interval N] [--duration N] [--snapshot]` |
 | **Motion detection — get/set** | `motion [cam] [--enable\|--disable] [--sensitivity S]` |
 | **Audio alarm — get/set** | `audio-alarm [cam] [--enable\|--disable] [--threshold N]` |
 | **Recording options — sound on/off** | `recording [cam] [--sound-on\|--sound-off]` |
@@ -231,6 +231,12 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 ```
 
 ---
+
+## What's New in v1.8.0
+
+- **RCP session caching**: The 2-step RCP handshake (0xff0c + 0xff0d) is now cached per proxy connection with a 5-minute TTL. Subsequent `rcp` subcommands on the same camera reuse the existing session, avoiding two redundant round-trips.
+- **`watch --snapshot`**: New flag — when a new event arrives, automatically downloads the event JPEG and opens it in the default viewer. Example: `python3 bosch_camera.py watch Garten --snapshot`
+- **`rcp snapshot` resolution fix**: Now reads `0x0a88` first to confirm the camera's configured snapshot resolution (320×180), then fetches `0x099e`. The saved filename and output now show the actual resolution instead of the incorrect "160×90".
 
 ## What's New in v1.7.0
 

@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.7.0"
+VERSION     = "1.8.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1829,8 +1829,9 @@ def cmd_watch(cfg: dict, args) -> None:
     session = make_session(token)
     cameras = get_cameras(cfg, session)
     cams    = resolve_cam(cfg, getattr(args, "cam", None))
-    interval = getattr(args, "interval", 30) or 30
-    duration = getattr(args, "duration", 0) or 0
+    interval  = getattr(args, "interval", 30) or 30
+    duration  = getattr(args, "duration", 0) or 0
+    auto_snap = getattr(args, "snapshot", False)
 
     # Build initial baseline of seen event IDs per camera
     last_seen: dict[str, str] = {}
@@ -1847,7 +1848,10 @@ def cmd_watch(cfg: dict, args) -> None:
     print(f"\nWatching {n_cams} camera(s)... (Ctrl+C to stop)")
     if duration:
         print(f"  Will stop after {duration}s.")
-    print(f"  Polling every {interval}s.\n")
+    print(f"  Polling every {interval}s.")
+    if auto_snap:
+        print(f"  --snapshot: will auto-download and open event JPEG on new events.")
+    print()
 
     start_time = time.time()
     total_new  = 0
@@ -1905,6 +1909,21 @@ def cmd_watch(cfg: dict, args) -> None:
                     if clip_url:
                         print(f"             🎬 {clip_url}")
                     total_new += 1
+                    # Auto-download and open the event snapshot if requested
+                    if auto_snap and img_url:
+                        try:
+                            r = session.get(img_url, verify=False, timeout=15)
+                            if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
+                                fname = f"event_{name}_{ts.replace(':', '-').replace(' ', '_')}.jpg"
+                                fpath = os.path.join(BASE_DIR, fname)
+                                with open(fpath, "wb") as f:
+                                    f.write(r.content)
+                                print(f"             💾 Saved: {fpath}")
+                                open_file(fpath)
+                            else:
+                                print(f"             ⚠️  Could not download snapshot (HTTP {r.status_code})")
+                        except Exception as snap_err:
+                            print(f"             ⚠️  Snapshot download error: {snap_err}")
 
                 if new_events:
                     last_seen[name] = new_events[0].get("id", baseline)
@@ -2145,6 +2164,10 @@ RCP_BASE_PORT = 42090
 # Fixed HELLO payload for auth level 3 (viewer) — matches Bosch app behaviour
 _RCP_HELLO_PAYLOAD = "0102004000000000040000000000000000010000000000000001000000000000"
 
+# RCP session ID cache: proxy_base → (sessionid, expires_timestamp)
+# Avoids re-running the 2-step RCP handshake on every command call.
+_RCP_SESSION_CACHE: dict[str, tuple[str, float]] = {}
+
 
 def rcp_open_connection(cam_id: str, token: str) -> tuple[str, str]:
     """
@@ -2226,6 +2249,24 @@ def rcp_session(proxy_base: str) -> str:
         raise RuntimeError(f"RCP SESSION_INIT returned HTTP {r2.status_code}")
 
     return sessionid
+
+
+def rcp_session_cached(proxy_base: str) -> str:
+    """Return a cached RCP session ID, calling rcp_session() if missing or expired (5 min TTL).
+
+    Avoids the 2-step handshake overhead (0xff0c + 0xff0d) when multiple RCP
+    commands are called in sequence for the same camera within a session.
+    """
+    now = time.time()
+    cached = _RCP_SESSION_CACHE.get(proxy_base)
+    if cached:
+        session_id, expires_at = cached
+        if now < expires_at:
+            return session_id
+        del _RCP_SESSION_CACHE[proxy_base]
+    session_id = rcp_session(proxy_base)
+    _RCP_SESSION_CACHE[proxy_base] = (session_id, now + 300.0)
+    return session_id
 
 
 def rcp_read(rcp_url: str, command: str, sessionid: str,
@@ -2358,8 +2399,8 @@ def _rcp_setup(cam_info: dict, token: str) -> tuple[str, str]:
     print(f"  🌐  Opening REMOTE proxy connection...")
     proxy_base, _ = rcp_open_connection(cam_id, token)
     print(f"  🔗  Proxy: {proxy_base}")
-    print(f"  🤝  RCP session handshake...")
-    sessionid = rcp_session(proxy_base)
+    print(f"  🤝  RCP session handshake (cached)...")
+    sessionid = rcp_session_cached(proxy_base)
     print(f"  ✅  Session: {sessionid}")
     rcp_url = f"{proxy_base}/rcp.xml"
     return rcp_url, sessionid
@@ -2372,7 +2413,7 @@ def cmd_rcp(cfg: dict, args) -> None:
     Subcommands:
       info      — camera identity: MAC, product name, FQDN, LAN IP
       clock     — real-time camera clock (0x0a0f)
-      snapshot  — RCP JPEG thumbnail 160x90 (0x099e) — save + open
+      snapshot  — RCP JPEG thumbnail 320×180 (0x099e, resolution from 0x0a88) — save + open
       alarms    — alarm catalog from 0x0c38 (UTF-16-BE)
       privacy   — privacy mask state read (0x0d00)
       dimmer    — LED dimmer value 0-100 (0x0c22 T_WORD)
@@ -2462,14 +2503,22 @@ def cmd_rcp(cfg: dict, args) -> None:
         # ── snapshot ──────────────────────────────────────────────────────────
         if sub in ("snapshot", "all"):
             print(f"\n  ── RCP Thumbnail Snapshot ────────────────────────────────")
+            # Confirm resolution via 0x0a88 (returns 8B: width 4B BE + height 4B BE)
+            import struct as _struct
+            res_d = rcp_read(rcp_url, "0x0a88", sessionid)
+            if res_d and len(res_d) >= 8:
+                w, h = _struct.unpack(">II", res_d[:8])
+                print(f"  Resolution: {w}×{h}  (from 0x0a88)")
+            else:
+                w, h = 320, 180
+                print(f"  Resolution: {w}×{h}  (assumed — 0x0a88 not available)")
             d = rcp_read(rcp_url, "0x099e", sessionid)
             if d and d[:2] == b"\xff\xd8":  # JPEG magic
-                import tempfile
                 suffix = f"_rcp_thumb_{name.replace(' ', '_')}.jpg"
                 tmp = os.path.join(BASE_DIR, f"rcp_snapshot{suffix}")
                 with open(tmp, "wb") as f:
                     f.write(d)
-                print(f"  Thumbnail:  160×90 JPEG  ({len(d):,} bytes)")
+                print(f"  Thumbnail:  {w}×{h} JPEG  ({len(d):,} bytes)")
                 print(f"  Saved:      {tmp}")
                 open_file(tmp)
             elif d:
@@ -3554,7 +3603,8 @@ def main():
             "    python3 bosch_camera.py watch\n"
             "    python3 bosch_camera.py watch Garten\n"
             "    python3 bosch_camera.py watch Garten --interval 15\n"
-            "    python3 bosch_camera.py watch --duration 600"
+            "    python3 bosch_camera.py watch --duration 600\n"
+            "    python3 bosch_camera.py watch Garten --snapshot   # auto-open JPEG on new event"
         ),
     )
     p_watch.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
@@ -3562,6 +3612,8 @@ def main():
                          help="Poll interval in seconds (default: 30)")
     p_watch.add_argument("--duration", type=int, default=0, metavar="N",
                          help="Stop after N seconds (default: 0 = infinite)")
+    p_watch.add_argument("--snapshot", action="store_true",
+                         help="Auto-download and open the event JPEG when a new event arrives")
 
     # ── motion ─────────────────────────────────────────────────────────────────
     p_motion = subparsers.add_parser(
