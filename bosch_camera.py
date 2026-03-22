@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.3.0"
+VERSION     = "1.4.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -2045,6 +2045,9 @@ def cmd_rcp(cfg: dict, args) -> None:
       dimmer    — LED dimmer value 0-100 (0x0c22 T_WORD)
       motion    — motion zone count from 0x0c0a
       services  — network services list from 0x0c62
+      frame     — raw video frame 320x180 YUV422 (0x0c98) → JPEG
+      script    — IVA automation script gzip (0x09f3) → text
+      iva       — IVA rule types + resiMotion config (0x0ba9 + 0x0a1b)
       all       — run all of the above
 
     The cloud proxy hash acts as the credential — no username/password needed.
@@ -2058,13 +2061,13 @@ def cmd_rcp(cfg: dict, args) -> None:
 
     # Allow "rcp info" without a camera name (sub parsed as cam_arg)
     RCP_SUBS = ("info", "clock", "snapshot", "alarms", "privacy",
-                "dimmer", "motion", "services", "all")
+                "dimmer", "motion", "services", "frame", "script", "iva", "all")
     if cam_arg and cam_arg.lower() in RCP_SUBS and not sub:
         sub, cam_arg = cam_arg.lower(), None
 
     if not sub:
         print("\n  ℹ️   Usage: python3 bosch_camera.py rcp [camera] <subcommand>")
-        print("  Subcommands: info | clock | snapshot | alarms | privacy | dimmer | motion | services | all")
+        print("  Subcommands: info | clock | snapshot | alarms | privacy | dimmer | motion | services | frame | script | iva | all")
         return
 
     cams = resolve_cam(cfg, cam_arg)
@@ -2224,6 +2227,94 @@ def cmd_rcp(cfg: dict, args) -> None:
                     print(f"  Services raw: {len(d)} bytes  {d[:48].hex()}")
             else:
                 print(f"  Services:   (not available)")
+
+        # ── frame ─────────────────────────────────────────────────────────────
+        if sub in ("frame", "all"):
+            print(f"\n  ── Raw Frame (0x0c98) ────────────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c98", sessionid)
+            if d and len(d) == 115200:
+                safe_name = name.replace(' ', '_')
+                try:
+                    import numpy as np
+                    from PIL import Image
+                    # YUV422 interleaved (YUYV): each 4 bytes = 2 pixels: Y0 U Y1 V
+                    raw = np.frombuffer(d, dtype=np.uint8).reshape(180, 320, 2)
+                    # Expand to YUV444
+                    y = raw[:, :, 0].astype(np.float32)
+                    uv = raw[:, :, 1].astype(np.float32)
+                    u = np.repeat(uv[:, 0::2][:, :, np.newaxis], 2, axis=1).reshape(180, 320) - 128
+                    v = np.repeat(uv[:, 1::2][:, :, np.newaxis], 2, axis=1).reshape(180, 320) - 128
+                    r = np.clip(y + 1.402 * v, 0, 255).astype(np.uint8)
+                    g = np.clip(y - 0.344136 * u - 0.714136 * v, 0, 255).astype(np.uint8)
+                    b = np.clip(y + 1.772 * u, 0, 255).astype(np.uint8)
+                    rgb = np.stack([r, g, b], axis=2)
+                    img = Image.fromarray(rgb)
+                    path = os.path.join(BASE_DIR, f"rcp_frame_{safe_name}.jpg")
+                    img.save(path, "JPEG")
+                    print(f"  Frame:      320x180 YUV422 ({len(d):,} bytes) -> saved as JPEG: {path}")
+                    open_file(path)
+                except Exception:
+                    path = os.path.join(BASE_DIR, f"rcp_frame_{safe_name}.yuv")
+                    with open(path, "wb") as f:
+                        f.write(d)
+                    print(f"  Frame:      320x180 YUV422 ({len(d):,} bytes) -> saved as raw YUV: {path}")
+                    print(f"  Note:       Install numpy + Pillow for JPEG conversion")
+            elif d:
+                safe_name = name.replace(' ', '_')
+                path = os.path.join(BASE_DIR, f"rcp_frame_{safe_name}.bin")
+                with open(path, "wb") as f:
+                    f.write(d)
+                print(f"  Frame:      {len(d):,} bytes (unexpected size — saved as .bin: {path})")
+            else:
+                print(f"  Frame:      (not available)")
+
+        # ── script ────────────────────────────────────────────────────────────
+        if sub in ("script", "all"):
+            print(f"\n  ── IVA Automation Script (0x09f3) ────────────────────────")
+            d = rcp_read(rcp_url, "0x09f3", sessionid)
+            if d and d[:2] == b'\x1f\x8b':  # gzip magic
+                import gzip
+                try:
+                    text = gzip.decompress(d).decode('utf-8', errors='replace')
+                    print(f"  Script:     {len(d):,} bytes compressed -> {len(text):,} chars decompressed")
+                    for line in text.splitlines():
+                        print(f"  {line}")
+                except Exception as exc:
+                    print(f"  Decompress error: {exc}")
+                    print(f"  Raw header: {d[:16].hex()}")
+            elif d:
+                print(f"  Data:       {len(d):,} bytes (not gzip)")
+                print(f"  Raw header: {d[:16].hex()}")
+            else:
+                print(f"  Script:     (not available)")
+
+        # ── iva ───────────────────────────────────────────────────────────────
+        if sub in ("iva", "all"):
+            print(f"\n  ── IVA Rules & resiMotion Config ─────────────────────────")
+            # 0x0ba9 — IVA rule type names (null-terminated ASCII list)
+            d = rcp_read(rcp_url, "0x0ba9", sessionid)
+            if d:
+                rule_names = [s for s in d.decode("ascii", errors="replace").split("\x00") if s.strip()]
+                if rule_names:
+                    print(f"  IVA rule types ({len(rule_names)}):")
+                    for rn in rule_names:
+                        print(f"    • {rn}")
+                else:
+                    print(f"  IVA rule types: raw {len(d)} bytes  {d[:32].hex()}")
+            else:
+                print(f"  IVA rule types: (not available)")
+            # 0x0a1b — resiMotion config (motion detection polygon + sensitivity params)
+            d = rcp_read(rcp_url, "0x0a1b", sessionid)
+            if d:
+                try:
+                    text = d.decode("utf-8", errors="replace").rstrip("\x00")
+                    print(f"  resiMotion config ({len(d):,} bytes):")
+                    for line in text.splitlines():
+                        print(f"    {line}")
+                except Exception:
+                    print(f"  resiMotion raw: {len(d):,} bytes  {d[:32].hex()}")
+            else:
+                print(f"  resiMotion config: (not available)")
 
         print()
 
@@ -3011,6 +3102,9 @@ def main():
             "    dimmer    — LED dimmer value 0-100 (0x0c22 T_WORD)\n"
             "    motion    — motion zones from 0x0c0a (count + coords)\n"
             "    services  — network services list from 0x0c62\n"
+            "    frame     — raw video frame (0x0c98, 320x180 YUV422 -> JPEG)\n"
+            "    script    — IVA automation script (0x09f3, gzip -> text)\n"
+            "    iva       — IVA rule types + resiMotion config (0x0ba9 + 0x0a1b)\n"
             "    all       — run all of the above"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3033,7 +3127,7 @@ def main():
     p_rcp.add_argument(
         "sub",
         nargs="?",
-        metavar="info|clock|snapshot|alarms|privacy|dimmer|motion|services|all",
+        metavar="info|clock|snapshot|alarms|privacy|dimmer|motion|services|frame|script|iva|all",
         help="RCP subcommand to run",
     )
 
