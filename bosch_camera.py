@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.2.0"
+VERSION     = "1.3.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1368,6 +1368,41 @@ def cmd_info(cfg: dict, args) -> None:
             except Exception:
                 pass
 
+            # ── RCP (via proxy) ───────────────────────────────────────────
+            print(f"\n      ── RCP (via proxy) ──────────────────────────────────────")
+            try:
+                # We already opened a REMOTE connection above for stream URLs.
+                # Re-use it by opening a new RCP session on the same proxy hash.
+                _rcp_proxy_base, _ = rcp_open_connection(cam_id, token)
+                _rcp_sessionid     = rcp_session(_rcp_proxy_base)
+                _rcp_url           = f"{_rcp_proxy_base}/rcp.xml"
+
+                # Product name (0x0aea)
+                d = rcp_read(_rcp_url, "0x0aea", _rcp_sessionid)
+                if d:
+                    print(f"      Product:       {rcp_parse_string(d)}")
+
+                # Cloud FQDN (0x0aee)
+                d = rcp_read(_rcp_url, "0x0aee", _rcp_sessionid)
+                if d:
+                    print(f"      Cloud FQDN:    {rcp_parse_string(d)}")
+
+                # Camera clock (0x0a0f)
+                d = rcp_read(_rcp_url, "0x0a0f", _rcp_sessionid)
+                if d:
+                    print(f"      Clock:         {rcp_parse_clock(d)}")
+
+                # LAN IP (0x0a36)
+                d = rcp_read(_rcp_url, "0x0a36", _rcp_sessionid)
+                if d:
+                    ip_str = rcp_parse_ip(d) if len(d) == 4 else rcp_parse_string(d)
+                    print(f"      LAN IP:        {ip_str}  (via RCP)")
+
+            except RuntimeError as _rcp_err:
+                print(f"      RCP:           unavailable ({_rcp_err})")
+            except Exception as _rcp_ex:
+                print(f"      RCP:           error — {_rcp_ex}")
+
         print()
 
 
@@ -1754,6 +1789,445 @@ def cmd_notifications(cfg: dict, args) -> None:
             print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
 
 
+# ══════════════════════════ RCP PROTOCOL ══════════════════════════════════════
+#
+# RCP (Remote Configuration Protocol) is Bosch's proprietary binary protocol
+# used internally for low-level camera configuration. It is tunnelled through
+# the cloud proxy at:
+#   https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml
+#
+# Auth level via cloud proxy hash = 3 (read-only / viewer). Writes require
+# a service account (auth level 5) which is not accessible via the cloud proxy.
+#
+# Session flow:
+#   1. WRITE 0xff0c (HELLO) with a fixed payload → response contains sessionid
+#   2. WRITE 0xff0d (SESSION_INIT) with the sessionid to activate the session
+#   3. READ any command using the sessionid as a query parameter
+#
+# All payloads are hex-encoded in the URL query string.
+# Responses are XML: <rcp_cmd> ... <str>HEX</str> ... </rcp_cmd>
+
+RCP_BASE_PORT = 42090
+
+# Fixed HELLO payload for auth level 3 (viewer) — matches Bosch app behaviour
+_RCP_HELLO_PAYLOAD = "0102004000000000040000000000000000010000000000000001000000000000"
+
+
+def rcp_open_connection(cam_id: str, token: str) -> tuple[str, str]:
+    """
+    Open a REMOTE proxy connection for the given camera.
+    Returns (proxy_base_url, proxy_hash_path) where:
+      proxy_base_url = 'https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}'
+    Raises RuntimeError on failure.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    r = requests.put(
+        f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
+        headers=headers,
+        json={"type": "REMOTE", "highQualityVideo": False},
+        verify=False, timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"PUT /connection returned HTTP {r.status_code}")
+    data = r.json()
+    urls = data.get("urls", [])
+    if not urls:
+        raise RuntimeError("No URLs in /connection response")
+    # urls[0] = "proxy-NN.live.cbs.boschsecurity.com:42090/{hash}"
+    raw = urls[0]
+    proxy_base = f"https://{raw}"
+    return proxy_base, raw
+
+
+def rcp_session(proxy_base: str) -> str:
+    """
+    Perform the RCP session handshake via the proxy.
+    Step 1: WRITE 0xff0c (HELLO) — get a sessionid back
+    Step 2: WRITE 0xff0d (SESSION_INIT) with that sessionid
+    Returns sessionid string (e.g. '0x1a2b3c4d').
+    Raises RuntimeError on failure.
+    """
+    import re as _re
+
+    rcp_url = f"{proxy_base}/rcp.xml"
+
+    # Step 1: HELLO (0xff0c WRITE P_OCTET)
+    params_hello = {
+        "command": "0xff0c",
+        "direction": "WRITE",
+        "type": "P_OCTET",
+        "payload": _RCP_HELLO_PAYLOAD,
+    }
+    r1 = requests.get(rcp_url, params=params_hello,
+                      auth=("", ""), verify=False, timeout=10)
+    if r1.status_code != 200:
+        raise RuntimeError(f"RCP HELLO returned HTTP {r1.status_code}")
+
+    m = _re.search(r"<sessionid>(0x[0-9a-fA-F]+)</sessionid>", r1.text)
+    if not m:
+        # Try to extract from <str> field (hex-encoded XML)
+        ms = _re.search(r"<str>([0-9a-fA-F]+)</str>", r1.text)
+        if ms:
+            raw = bytes.fromhex(ms.group(1))
+            m2  = _re.search(rb"(0x[0-9a-fA-F]+)", raw)
+            if m2:
+                sessionid = m2.group(1).decode()
+            else:
+                raise RuntimeError(f"Cannot parse sessionid from HELLO response: {r1.text[:400]}")
+        else:
+            raise RuntimeError(f"No sessionid in HELLO response: {r1.text[:400]}")
+    else:
+        sessionid = m.group(1)
+
+    # Step 2: SESSION_INIT (0xff0d WRITE P_OCTET sessionid=...)
+    params_init = {
+        "command": "0xff0d",
+        "direction": "WRITE",
+        "type": "P_OCTET",
+        "sessionid": sessionid,
+        "payload": _RCP_HELLO_PAYLOAD,
+    }
+    r2 = requests.get(rcp_url, params=params_init,
+                      auth=("", ""), verify=False, timeout=10)
+    if r2.status_code != 200:
+        raise RuntimeError(f"RCP SESSION_INIT returned HTTP {r2.status_code}")
+
+    return sessionid
+
+
+def rcp_read(rcp_url: str, command: str, sessionid: str,
+             type_: str = "P_OCTET", num: int = 0) -> bytes | None:
+    """
+    Send an RCP READ request and return the raw result bytes.
+    Returns None if the response is empty (len=0) or an error occurs.
+
+    Args:
+        rcp_url:   full URL to rcp.xml, e.g. https://proxy-NN:42090/{hash}/rcp.xml
+        command:   hex command code, e.g. '0x0a0f'
+        sessionid: session ID from rcp_session()
+        type_:     RCP type string, default 'P_OCTET'
+        num:       instance number (0 = default)
+    """
+    import re as _re
+
+    params = {
+        "command":   command,
+        "direction": "READ",
+        "type":      type_,
+        "num":       num,
+        "sessionid": sessionid,
+    }
+    try:
+        r = requests.get(rcp_url, params=params,
+                         auth=("", ""), verify=False, timeout=10)
+    except Exception as e:
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    # Parse XML — result is in <str>HEX</str>
+    m = _re.search(r"<str>([0-9a-fA-F]*)</str>", r.text)
+    if not m:
+        return None
+    hex_str = m.group(1)
+    if not hex_str:
+        return None   # empty result
+    try:
+        return bytes.fromhex(hex_str)
+    except ValueError:
+        return None
+
+
+def rcp_parse_utf16be_strings(data: bytes) -> list[str]:
+    """
+    Parse a UTF-16-BE encoded string list (as used in RCP 0x0c38 alarm catalog).
+    Splits on null words (\\x00\\x00) and decodes each non-empty segment.
+    Returns list of strings.
+    """
+    results = []
+    # Split on null word boundaries
+    i = 0
+    current = bytearray()
+    while i < len(data) - 1:
+        word = data[i:i+2]
+        if word == b"\x00\x00":
+            if current:
+                try:
+                    s = current.decode("utf-16-be").strip("\x00").strip()
+                    if s:
+                        results.append(s)
+                except Exception:
+                    pass
+                current = bytearray()
+        else:
+            current += word
+        i += 2
+    if current:
+        try:
+            s = current.decode("utf-16-be").strip("\x00").strip()
+            if s:
+                results.append(s)
+        except Exception:
+            pass
+    return results
+
+
+def rcp_parse_clock(data: bytes) -> str:
+    """
+    Parse the 8-byte RCP clock from command 0x0a0f.
+    Format: YYYY(2B big-endian) MM(1B) DD(1B) HH(1B) MM(1B) SS(1B) DOW(1B)
+    Returns a formatted datetime string, e.g. '2026-03-22 05:54:25'.
+    """
+    if len(data) < 7:
+        return f"(invalid clock data: {data.hex()})"
+    try:
+        year  = (data[0] << 8) | data[1]
+        month = data[2]
+        day   = data[3]
+        hour  = data[4]
+        minute = data[5]
+        second = data[6]
+        return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+    except Exception as e:
+        return f"(parse error: {e})"
+
+
+def rcp_parse_string(data: bytes) -> str:
+    """Decode a null-terminated ASCII/UTF-8 string from RCP data bytes."""
+    try:
+        return data.rstrip(b"\x00").decode("utf-8", errors="replace")
+    except Exception:
+        return data.hex()
+
+
+def rcp_parse_ip(data: bytes) -> str:
+    """Parse a 4-byte big-endian IPv4 address from RCP data."""
+    if len(data) >= 4:
+        return f"{data[0]}.{data[1]}.{data[2]}.{data[3]}"
+    return data.hex()
+
+
+def rcp_parse_word(data: bytes) -> int | None:
+    """Parse a 2-byte big-endian unsigned integer (T_WORD) from RCP data."""
+    if len(data) >= 2:
+        return (data[0] << 8) | data[1]
+    return None
+
+
+def _rcp_setup(cam_info: dict, token: str) -> tuple[str, str]:
+    """
+    Open a REMOTE connection and perform RCP session handshake.
+    Returns (rcp_url, sessionid).
+    Prints status messages. Raises RuntimeError on failure.
+    """
+    cam_id = cam_info["id"]
+    print(f"  🌐  Opening REMOTE proxy connection...")
+    proxy_base, _ = rcp_open_connection(cam_id, token)
+    print(f"  🔗  Proxy: {proxy_base}")
+    print(f"  🤝  RCP session handshake...")
+    sessionid = rcp_session(proxy_base)
+    print(f"  ✅  Session: {sessionid}")
+    rcp_url = f"{proxy_base}/rcp.xml"
+    return rcp_url, sessionid
+
+
+def cmd_rcp(cfg: dict, args) -> None:
+    """
+    RCP — Remote Configuration Protocol reads via cloud proxy.
+
+    Subcommands:
+      info      — camera identity: MAC, product name, FQDN, LAN IP
+      clock     — real-time camera clock (0x0a0f)
+      snapshot  — RCP JPEG thumbnail 160x90 (0x099e) — save + open
+      alarms    — alarm catalog from 0x0c38 (UTF-16-BE)
+      privacy   — privacy mask state read (0x0d00)
+      dimmer    — LED dimmer value 0-100 (0x0c22 T_WORD)
+      motion    — motion zone count from 0x0c0a
+      services  — network services list from 0x0c62
+      all       — run all of the above
+
+    The cloud proxy hash acts as the credential — no username/password needed.
+    Auth level via cloud proxy = 3 (read-only). Writes require auth level 5.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    sub     = (getattr(args, "sub", None) or "").lower()
+
+    # Allow "rcp info" without a camera name (sub parsed as cam_arg)
+    RCP_SUBS = ("info", "clock", "snapshot", "alarms", "privacy",
+                "dimmer", "motion", "services", "all")
+    if cam_arg and cam_arg.lower() in RCP_SUBS and not sub:
+        sub, cam_arg = cam_arg.lower(), None
+
+    if not sub:
+        print("\n  ℹ️   Usage: python3 bosch_camera.py rcp [camera] <subcommand>")
+        print("  Subcommands: info | clock | snapshot | alarms | privacy | dimmer | motion | services | all")
+        return
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        print(f"\n── RCP: {name} ({sub}) ─────────────────────────────────────────")
+
+        try:
+            rcp_url, sessionid = _rcp_setup(cam_info, token)
+        except RuntimeError as e:
+            print(f"  ❌  RCP setup failed: {e}")
+            continue
+
+        run_all = (sub == "all")
+
+        # ── info ──────────────────────────────────────────────────────────────
+        if sub in ("info", "all"):
+            print(f"\n  ── Identity ──────────────────────────────────────────────")
+            # 0x0aea — product name (null-terminated ASCII)
+            d = rcp_read(rcp_url, "0x0aea", sessionid)
+            if d:
+                print(f"  Product:    {rcp_parse_string(d)}")
+            else:
+                print(f"  Product:    (not available)")
+            # 0x0aee — cloud FQDN
+            d = rcp_read(rcp_url, "0x0aee", sessionid)
+            if d:
+                print(f"  Cloud FQDN: {rcp_parse_string(d)}")
+            else:
+                print(f"  Cloud FQDN: (not available)")
+            # 0x0a36 — LAN IP (4-byte or string)
+            d = rcp_read(rcp_url, "0x0a36", sessionid)
+            if d:
+                ip_str = rcp_parse_ip(d) if len(d) == 4 else rcp_parse_string(d)
+                print(f"  LAN IP:     {ip_str}  (via RCP)")
+            else:
+                print(f"  LAN IP:     (not available)")
+            # 0x0a30 — MAC address (6 bytes)
+            d = rcp_read(rcp_url, "0x0a30", sessionid)
+            if d and len(d) >= 6:
+                mac_str = ":".join(f"{b:02x}" for b in d[:6])
+                print(f"  MAC:        {mac_str}  (via RCP)")
+            elif d:
+                print(f"  MAC:        {rcp_parse_string(d)}")
+            else:
+                print(f"  MAC:        (not available)")
+
+        # ── clock ─────────────────────────────────────────────────────────────
+        if sub in ("clock", "all"):
+            print(f"\n  ── Camera Clock ──────────────────────────────────────────")
+            d = rcp_read(rcp_url, "0x0a0f", sessionid)
+            if d:
+                print(f"  Clock:      {rcp_parse_clock(d)}  (camera local time)")
+                print(f"  Raw:        {d.hex()}")
+            else:
+                print(f"  Clock:      (not available)")
+
+        # ── snapshot ──────────────────────────────────────────────────────────
+        if sub in ("snapshot", "all"):
+            print(f"\n  ── RCP Thumbnail Snapshot ────────────────────────────────")
+            d = rcp_read(rcp_url, "0x099e", sessionid)
+            if d and d[:2] == b"\xff\xd8":  # JPEG magic
+                import tempfile
+                suffix = f"_rcp_thumb_{name.replace(' ', '_')}.jpg"
+                tmp = os.path.join(BASE_DIR, f"rcp_snapshot{suffix}")
+                with open(tmp, "wb") as f:
+                    f.write(d)
+                print(f"  Thumbnail:  160×90 JPEG  ({len(d):,} bytes)")
+                print(f"  Saved:      {tmp}")
+                open_file(tmp)
+            elif d:
+                # Not JPEG — save raw for inspection
+                tmp = os.path.join(BASE_DIR, f"rcp_snapshot_{name.replace(' ', '_')}.bin")
+                with open(tmp, "wb") as f:
+                    f.write(d)
+                print(f"  Data:       {len(d)} bytes (not JPEG — saved as .bin: {tmp})")
+                print(f"  Header:     {d[:16].hex()}")
+            else:
+                print(f"  Snapshot:   (not available)")
+
+        # ── alarms ────────────────────────────────────────────────────────────
+        if sub in ("alarms", "all"):
+            print(f"\n  ── Alarm Catalog (0x0c38) ────────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c38", sessionid)
+            if d:
+                strings = rcp_parse_utf16be_strings(d)
+                if strings:
+                    for i, s in enumerate(strings):
+                        print(f"  [{i:02d}] {s}")
+                else:
+                    print(f"  (no strings decoded — raw {len(d)} bytes: {d[:32].hex()}...)")
+            else:
+                print(f"  Alarms:     (not available)")
+
+        # ── privacy ───────────────────────────────────────────────────────────
+        if sub in ("privacy", "all"):
+            print(f"\n  ── Privacy Mask State (0x0d00) ───────────────────────────")
+            d = rcp_read(rcp_url, "0x0d00", sessionid)
+            if d and len(d) >= 1:
+                state_byte = d[1] if len(d) > 1 else d[0]
+                state_str  = "ON (masked)" if state_byte else "OFF (visible)"
+                icon       = "🔒" if state_byte else "👁️"
+                print(f"  {icon}  Privacy mask: {state_str}  (byte[1]={state_byte:#04x})")
+                print(f"  Raw:          {d.hex()}")
+            else:
+                print(f"  Privacy:    (not available)")
+
+        # ── dimmer ────────────────────────────────────────────────────────────
+        if sub in ("dimmer", "all"):
+            print(f"\n  ── LED Dimmer (0x0c22) ───────────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c22", sessionid, type_="T_WORD")
+            if d is None:
+                # Try P_OCTET fallback
+                d = rcp_read(rcp_url, "0x0c22", sessionid)
+            if d:
+                val = rcp_parse_word(d)
+                if val is not None:
+                    print(f"  Dimmer:     {val}  (0=off, 100=max)")
+                else:
+                    print(f"  Dimmer raw: {d.hex()}")
+            else:
+                print(f"  Dimmer:     (not available)")
+
+        # ── motion ────────────────────────────────────────────────────────────
+        if sub in ("motion", "all"):
+            print(f"\n  ── Motion Zones (0x0c0a) ─────────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c0a", sessionid)
+            if d:
+                # Each zone is typically 8 bytes: x1(2B) y1(2B) x2(2B) y2(2B) in 0-10000 units
+                zone_size = 8
+                n_zones   = len(d) // zone_size
+                print(f"  Zones:      {n_zones} zone(s)  ({len(d)} bytes raw)")
+                for z in range(n_zones):
+                    chunk = d[z*zone_size:(z+1)*zone_size]
+                    if len(chunk) == 8:
+                        x1 = (chunk[0] << 8) | chunk[1]
+                        y1 = (chunk[2] << 8) | chunk[3]
+                        x2 = (chunk[4] << 8) | chunk[5]
+                        y2 = (chunk[6] << 8) | chunk[7]
+                        print(f"  Zone {z}:     ({x1},{y1}) → ({x2},{y2})  [0-10000 coords]")
+                    else:
+                        print(f"  Zone {z}:     {chunk.hex()}")
+            else:
+                print(f"  Motion:     (not available)")
+
+        # ── services ──────────────────────────────────────────────────────────
+        if sub in ("services", "all"):
+            print(f"\n  ── Network Services (0x0c62) ─────────────────────────────")
+            d = rcp_read(rcp_url, "0x0c62", sessionid)
+            if d:
+                # Services list is typically null-terminated ASCII strings
+                services = [s for s in d.decode("ascii", errors="replace").split("\x00") if s.strip()]
+                if services:
+                    for svc in services:
+                        print(f"  Service:    {svc}")
+                else:
+                    print(f"  Services raw: {len(d)} bytes  {d[:48].hex()}")
+            else:
+                print(f"  Services:   (not available)")
+
+        print()
+
+
 def cmd_token(cfg: dict, args) -> None:
     """Show token status and optionally renew it.
 
@@ -1958,6 +2432,7 @@ def cmd_menu(cfg: dict) -> None:
     class A:
         cam     = None
         action  = None
+        sub     = None
         limit   = None
         snaps_only  = False
         clips_only  = False
@@ -2513,6 +2988,55 @@ def main():
         epilog="  Example:\n    python3 bosch_camera.py config",
     )
 
+    # ── rcp ────────────────────────────────────────────────────────────────────
+    p_rcp = subparsers.add_parser(
+        "rcp",
+        help="RCP protocol reads via cloud proxy (info, clock, snapshot, alarms, ...)",
+        description=(
+            "🔌  rcp — Remote Configuration Protocol reads via cloud proxy\n"
+            "\n"
+            "  Opens a REMOTE proxy connection automatically, performs the RCP\n"
+            "  session handshake, then reads the requested data.\n"
+            "\n"
+            "  The proxy hash acts as the credential — no extra auth needed.\n"
+            "  Auth level = 3 (read-only). Writes require level 5 (not accessible\n"
+            "  via cloud proxy).\n"
+            "\n"
+            "  Subcommands:\n"
+            "    info      — identity: MAC, product name, FQDN, LAN IP\n"
+            "    clock     — real-time camera clock (0x0a0f)\n"
+            "    snapshot  — RCP JPEG thumbnail 160x90 (0x099e) — save + open\n"
+            "    alarms    — alarm catalog from 0x0c38 (UTF-16-BE parsed)\n"
+            "    privacy   — privacy mask state read (0x0d00 byte[1])\n"
+            "    dimmer    — LED dimmer value 0-100 (0x0c22 T_WORD)\n"
+            "    motion    — motion zones from 0x0c0a (count + coords)\n"
+            "    services  — network services list from 0x0c62\n"
+            "    all       — run all of the above"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py rcp info\n"
+            "    python3 bosch_camera.py rcp Garten info\n"
+            "    python3 bosch_camera.py rcp Kamera clock\n"
+            "    python3 bosch_camera.py rcp Garten snapshot\n"
+            "    python3 bosch_camera.py rcp all\n"
+            "    python3 bosch_camera.py rcp Garten all"
+        ),
+    )
+    p_rcp.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_rcp.add_argument(
+        "sub",
+        nargs="?",
+        metavar="info|clock|snapshot|alarms|privacy|dimmer|motion|services|all",
+        help="RCP subcommand to run",
+    )
+
     # ── rescan ─────────────────────────────────────────────────────────────────
     subparsers.add_parser(
         "rescan",
@@ -2533,7 +3057,7 @@ def main():
     # Provide sensible defaults for attributes that some subparsers don't define,
     # so all cmd_* functions can safely use getattr(args, "...", default).
     _defaults = dict(
-        cam=None, action=None, limit=None,
+        cam=None, action=None, sub=None, limit=None,
         snaps_only=False, clips_only=False, re_download=False,
         live=False, vlc=False, full=False, minutes=None,
     )
@@ -2577,6 +3101,7 @@ def main():
         "light":         cmd_light,
         "pan":           cmd_pan,
         "notifications": cmd_notifications,
+        "rcp":           cmd_rcp,
         "token":         cmd_token,
         "config":        cmd_config,
         "rescan":        cmd_rescan,

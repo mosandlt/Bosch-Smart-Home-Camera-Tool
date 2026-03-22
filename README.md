@@ -1,8 +1,8 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, and pan control — all from the command line.
-> No official API. No app needed after setup. **v1.2.0**
+> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, and RCP protocol reads — all from the command line.
+> No official API. No app needed after setup. **v1.3.0**
 
 ---
 
@@ -57,6 +57,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Camera light — on/off via cloud API** | `light [cam] [on\|off]` |
 | **Push notifications — on/off** | `notifications [cam] [on\|off]` |
 | **Pan 360 camera** | `pan [cam] [left\|center\|right\|<-120..120>]` |
+| **RCP reads via cloud proxy** | `rcp [cam] <info\|clock\|snapshot\|alarms\|...>` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
 
@@ -166,6 +167,18 @@ python3 bosch_camera.py pan Indoor center        # pan to center (0°)
 python3 bosch_camera.py pan Indoor right         # pan to right limit
 python3 bosch_camera.py pan Indoor 45            # pan to absolute position (degrees)
 
+# RCP protocol reads via cloud proxy
+python3 bosch_camera.py rcp info                 # all cameras: product name, FQDN, LAN IP, MAC
+python3 bosch_camera.py rcp Outdoor info         # identity for one camera
+python3 bosch_camera.py rcp Outdoor clock        # real-time camera clock
+python3 bosch_camera.py rcp Outdoor snapshot     # RCP JPEG thumbnail 160×90 — save + open
+python3 bosch_camera.py rcp Outdoor alarms       # alarm catalog (UTF-16-BE strings)
+python3 bosch_camera.py rcp Outdoor privacy      # privacy mask state read
+python3 bosch_camera.py rcp Outdoor dimmer       # LED dimmer value 0-100
+python3 bosch_camera.py rcp Outdoor motion       # motion zone count + coordinates
+python3 bosch_camera.py rcp Outdoor services     # network services list
+python3 bosch_camera.py rcp Outdoor all          # run all RCP reads
+
 # Token
 python3 bosch_camera.py token                    # show token info + expiry
 python3 bosch_camera.py token fix                # silent renewal via refresh_token
@@ -175,6 +188,15 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.3.0
+
+- New `rcp` command: read low-level camera data via the RCP (Remote Configuration Protocol) tunnelled through the cloud proxy
+- RCP subcommands: `info`, `clock`, `snapshot`, `alarms`, `privacy`, `dimmer`, `motion`, `services`, `all`
+- `info --full` now includes an RCP section: product name, cloud FQDN, camera clock, LAN IP
+- RCP session handshake (0xff0c / 0xff0d) implemented; no additional auth beyond the proxy hash
 
 ---
 
@@ -384,6 +406,57 @@ The tool iterates all events and downloads:
 
 Already-downloaded files are skipped (by filename). Rate-limited to
 0.5 s between requests to avoid API throttling.
+
+---
+
+### RCP Protocol — Low-Level Camera Reads
+
+After a REMOTE proxy connection is opened (`PUT /connection`), the same
+proxy hash also exposes the camera's **RCP (Remote Configuration Protocol)**
+endpoint at:
+
+```
+https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml
+```
+
+RCP is Bosch's proprietary binary protocol used internally for low-level
+camera configuration. All payloads are hex-encoded in the URL query string.
+Responses are XML containing a `<str>HEX</str>` field with the result bytes.
+
+**Session handshake:**
+
+```
+# Step 1: HELLO (0xff0c WRITE P_OCTET) — initiates session, returns sessionid
+GET /rcp.xml?command=0xff0c&direction=WRITE&type=P_OCTET&payload=0102004000...
+
+# Step 2: SESSION_INIT (0xff0d WRITE P_OCTET) — activates the session
+GET /rcp.xml?command=0xff0d&direction=WRITE&type=P_OCTET&sessionid=0xXXXXXXXX&payload=...
+```
+
+Basic auth `empty:empty` is used (the proxy hash is the real credential).
+Auth level via cloud proxy = **3 (viewer)** — read-only. Writes require
+auth level 5 (service account), which is not accessible via the cloud proxy.
+
+**Most useful RCP reads:**
+
+| Command | Type | Description |
+|---------|------|-------------|
+| `0x099e` | P_OCTET | JPEG thumbnail snapshot (160×90) |
+| `0x0a0f` | P_OCTET | Camera real-time clock (8 bytes: YYYY MM DD HH MM SS DOW) |
+| `0x0aea` | P_OCTET | Product name (null-terminated ASCII) |
+| `0x0aee` | P_OCTET | Cloud FQDN (null-terminated ASCII) |
+| `0x0a36` | P_OCTET | LAN IP address (4-byte big-endian) |
+| `0x0a30` | P_OCTET | MAC address (6 bytes) |
+| `0x0d00` | P_OCTET | Privacy mask state (byte[1]: 0=off, 1=on) |
+| `0x0c22` | T_WORD  | LED dimmer value (0-100) |
+| `0x0c0a` | P_OCTET | Motion zones (8 bytes each: x1 y1 x2 y2 in 0-10000 coords) |
+| `0x0c38` | P_OCTET | Alarm catalog (UTF-16-BE encoded string list) |
+| `0x0c62` | P_OCTET | Network services list (null-separated ASCII) |
+
+**Note:** The `rcp snapshot` subcommand (0x099e) returns a small 160×90 JPEG
+thumbnail directly from the camera's firmware — distinct from the cloud proxy
+`snap.jpg` which is a full 1920×1080 image. The thumbnail does not require a
+new proxy connection, only an active RCP session.
 
 ---
 
@@ -630,11 +703,23 @@ After opening a live connection (`PUT /connection REMOTE`), the proxy hash also 
 **RCP (Remote Configuration Protocol)** interface — normally LAN-only, but tunnelled through the proxy:
 
 ```
-GET https://proxy-XX.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml?command=HEX&direction=READ|WRITE&type=TYPE&payload=HEX
+GET https://proxy-XX.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml?command=HEX&direction=READ|WRITE&type=TYPE&sessionid=0xXXXX&payload=HEX
 ```
 
 This is Bosch's proprietary binary configuration protocol, used internally by the app for low-level
 camera settings. The hash from `PUT /connection` acts as the credential.
+
+Use the `rcp` command to access these reads:
+
+```bash
+python3 bosch_camera.py rcp Outdoor info       # product, FQDN, LAN IP, MAC
+python3 bosch_camera.py rcp Outdoor clock      # camera clock
+python3 bosch_camera.py rcp Outdoor snapshot   # 160×90 JPEG thumbnail
+python3 bosch_camera.py rcp Outdoor all        # all reads
+```
+
+See the [RCP Protocol](#rcp-protocol--low-level-camera-reads) section in "How It Works" for full details
+and a table of all known readable commands.
 
 ---
 
