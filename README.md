@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, and pan control — all from the command line.
-> No official API. No app needed after setup. **v1.1.0**
+> No official API. No app needed after setup. **v1.2.0**
 
 ---
 
@@ -121,6 +121,7 @@ Press a number, the command runs, then press Enter to return to the menu.
 # Status & Info
 python3 bosch_camera.py status
 python3 bosch_camera.py info               # full details + live stream URLs
+python3 bosch_camera.py info --full        # also fetch firmware, motion, audio, ambient light, WiFi
 
 # Snapshots
 python3 bosch_camera.py snapshot Outdoor          # latest motion-triggered JPEG
@@ -144,7 +145,8 @@ python3 bosch_camera.py events Outdoor --limit 20
 # Privacy mode (cloud API — no SHC needed)
 python3 bosch_camera.py privacy                  # show all cameras' privacy state
 python3 bosch_camera.py privacy Outdoor          # show one camera's privacy state
-python3 bosch_camera.py privacy Outdoor on       # enable privacy mode
+python3 bosch_camera.py privacy Outdoor on       # enable privacy mode (indefinite)
+python3 bosch_camera.py privacy Outdoor on --minutes 30  # enable privacy for 30 minutes
 python3 bosch_camera.py privacy Outdoor off      # disable privacy mode
 
 # Camera light (cloud API — no SHC needed)
@@ -173,6 +175,18 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.2.0
+
+- `info --full` flag: fetches 8 additional per-camera endpoints (firmware, motion, audio alarm, ambient light, WiFi, recording options, light override, commissioned state)
+- `privacy on --minutes N`: timed privacy mode via `privacyTimeSeconds`
+- WiFi info now shown in standard `info` output (SSID, signal, IP, MAC)
+- All `PUT /connection` calls now include `highQualityVideo: false` (matches app behaviour)
+- Live stream URL uses `inst=2` (correct proxy stream index, as used by the app)
+- Proxy snap 404 handling: automatic retry with a new connection session
+- 3-state notification display: `ALWAYS_OFF`, `FOLLOW_CAMERA_SCHEDULE`, `ON_CAMERA_SCHEDULE`
 
 ---
 
@@ -303,7 +317,7 @@ Response:
   "password": null,
   "urls": ["proxy-20.live.cbs.boschsecurity.com:42090/{hash}"],
   "imageUrlScheme":  "https://{url}/snap.jpg",
-  "videoUrlScheme":  "rtsp://{url}/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60",
+  "videoUrlScheme":  "rtsp://{url}/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60",  ← server returns inst=1 but app uses inst=2 for rtsps://
   "httpsUrlScheme":  "https://{url}/",
   "rtspUrl": null
 }
@@ -344,7 +358,7 @@ replace port `42090` → `443`, use `rtsps://` scheme.
 **Default: ffplay** (opened in a window, `live` command):
 ```bash
 ffplay -rtsp_transport tcp -tls_verify 0 \
-  "rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60"
+  "rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60"
 ```
 
 **VLC option** (`live --vlc`): VLC can't skip TLS cert verification, so the tool pipes via ffmpeg:
@@ -566,7 +580,7 @@ https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/snap.jpg?JpegSize=1206
   → Smaller image (1206px wide)
 
 # Port 443 — RTSP/1.0 over TLS  ✅ WORKING
-rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60
+rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60
   → Full 30fps H.264 1920×1080 + AAC 16kHz audio
   → Open with: ffplay -rtsp_transport tcp -tls_verify 0 -i "rtsps://..."
   → Or: ffmpeg -rtsp_transport tcp -tls_verify 0 -i "rtsps://..." -c copy out.mkv
@@ -575,6 +589,52 @@ rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=1&enable
 rtsp://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/rtsp_tunnel?...
   → Silently drops all connections
 ```
+
+---
+
+## Discovered API Endpoints (v1.2.0)
+
+The following endpoints were discovered via proxy analysis (mitmproxy capture of the Bosch Smart Home Camera app).
+
+### Account / Protocol
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v11/registration/check` | GET | User info + exact token expiration time |
+| `/protocol_support?protocol=11` | GET | Protocol support check |
+| `/v11/state/pre-maintenance` | GET | Server maintenance mode check |
+
+### Per-Camera (GET)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v11/video_inputs/{id}` | GET | Fetch single camera by ID (same shape as list entry) |
+| `/v11/video_inputs/{id}/commissioned` | GET | Pairing/connection status |
+| `/v11/video_inputs/{id}/firmware` | GET | Firmware version + update status |
+| `/v11/video_inputs/{id}/lighting_override` | GET | Current light override state |
+| `/v11/video_inputs/{id}/lighting_options` | GET | Full light schedule config |
+| `/v11/video_inputs/{id}/ambient_light_sensor_level` | GET | Ambient light sensor reading |
+| `/v11/video_inputs/{id}/motion` | GET | Motion detection on/off + sensitivity |
+| `/v11/video_inputs/{id}/motion_sensitive_areas` | GET | Motion zones (normalized rect coords) |
+| `/v11/video_inputs/{id}/audioAlarm` | GET | Audio alarm threshold + config |
+| `/v11/video_inputs/{id}/recording_options` | GET | Sound-in-recording setting |
+| `/v11/video_inputs/{id}/timestamp` | GET | Timestamp overlay on/off |
+| `/v11/video_inputs/{id}/wifiinfo` | GET | WiFi SSID, signal strength, local IP, MAC |
+| `/v11/video_inputs/{id}/rules` | GET | Camera automation rules |
+
+All of these are accessible via `info --full` (except `wifiinfo` which is shown by default in `info`).
+
+### RCP via Cloud Proxy
+
+After opening a live connection (`PUT /connection REMOTE`), the proxy hash also exposes the camera's
+**RCP (Remote Configuration Protocol)** interface — normally LAN-only, but tunnelled through the proxy:
+
+```
+GET https://proxy-XX.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml?command=HEX&direction=READ|WRITE&type=TYPE&payload=HEX
+```
+
+This is Bosch's proprietary binary configuration protocol, used internally by the app for low-level
+camera settings. The hash from `PUT /connection` acts as the credential.
 
 ---
 

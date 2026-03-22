@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.1.0"
+VERSION     = "1.2.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -388,6 +388,20 @@ def api_get_events(session: requests.Session, cam_id: str, limit: int = 400) -> 
     return r.json()
 
 
+def api_get_camera(session: requests.Session, cam_id: str) -> dict | None:
+    """
+    GET /v11/video_inputs/{cam_id} — fetch a single camera object by ID.
+    Returns the camera dict or None on error.
+    """
+    try:
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}", timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
 def build_filename(event: dict, ext: str) -> str:
     ts    = event.get("timestamp", "")[:19].replace(":", "-").replace("T", "_")
     etype = event.get("eventType", "EVENT")
@@ -516,42 +530,77 @@ def snap_from_proxy(cam_info: dict, token: str) -> bytes | None:
     """
     Live snapshot via PUT /connection.
     Tries LOCAL first (faster on home network), then REMOTE (cloud proxy).
+    If snap.jpg returns 404 (proxy session expired), automatically re-requests
+    a fresh connection and retries once.
     Returns JPEG bytes or None.
     """
     cam_id  = cam_info.get("id", "")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    for conn_type in LIVE_TYPE_CANDIDATES:
+
+    def _fetch_snap(conn_type: str) -> bytes | None:
         label = "local" if conn_type == "LOCAL" else "cloud proxy"
         print(f"  🌐  Opening {label} connection...")
-        try:
-            r = requests.put(
+        r = requests.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
+            headers=headers, json={"type": conn_type, "highQualityVideo": False}, verify=False, timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data     = r.json()
+        urls     = data.get("urls", [])
+        scheme   = data.get("imageUrlScheme", "https://{url}/snap.jpg")
+        api_user = data.get("user") or ""
+        api_pass = data.get("password") or ""
+        if not urls:
+            return None
+        snap_url = scheme.replace("{url}", urls[0])
+        snap_timeout = 5 if conn_type == "LOCAL" else 15
+        if api_user and api_pass:
+            from requests.auth import HTTPDigestAuth
+            snap_r = requests.get(snap_url, auth=HTTPDigestAuth(api_user, api_pass),
+                                  verify=False, timeout=snap_timeout)
+        else:
+            snap_r = requests.get(snap_url, verify=False, timeout=snap_timeout)
+        if snap_r.status_code == 200 and snap_r.headers.get("Content-Type", "").startswith("image"):
+            print(f"  ✅  Live snapshot ({label}): {len(snap_r.content):,} bytes")
+            return snap_r.content
+        elif snap_r.status_code == 404:
+            print(f"  ⚠️   Proxy session expired (404) — re-requesting connection...")
+            # Retry once with a fresh connection
+            r2 = requests.put(
                 f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
-                headers=headers, json={"type": conn_type}, verify=False, timeout=15,
+                headers=headers, json={"type": conn_type, "highQualityVideo": False}, verify=False, timeout=15,
             )
-            if r.status_code != 200:
-                continue
-            data     = r.json()
-            urls     = data.get("urls", [])
-            scheme   = data.get("imageUrlScheme", "https://{url}/snap.jpg")
-            api_user = data.get("user") or ""
-            api_pass = data.get("password") or ""
-            if not urls:
-                continue
-            snap_url = scheme.replace("{url}", urls[0])
-            # LOCAL returns Digest credentials; REMOTE needs no auth (hash in URL)
-            snap_timeout = 5 if conn_type == "LOCAL" else 15
-            if api_user and api_pass:
-                from requests.auth import HTTPDigestAuth
-                snap_r = requests.get(snap_url, auth=HTTPDigestAuth(api_user, api_pass),
-                                      verify=False, timeout=snap_timeout)
-            else:
-                snap_r = requests.get(snap_url, verify=False, timeout=snap_timeout)
-            if snap_r.status_code == 200 and snap_r.headers.get("Content-Type", "").startswith("image"):
-                print(f"  ✅  Live snapshot ({label}): {len(snap_r.content):,} bytes")
-                return snap_r.content
-            else:
-                print(f"  ⚠️   {label} snap returned HTTP {snap_r.status_code}")
+            if r2.status_code == 200:
+                data2     = r2.json()
+                urls2     = data2.get("urls", [])
+                scheme2   = data2.get("imageUrlScheme", "https://{url}/snap.jpg")
+                api_user2 = data2.get("user") or ""
+                api_pass2 = data2.get("password") or ""
+                if urls2:
+                    snap_url2 = scheme2.replace("{url}", urls2[0])
+                    if api_user2 and api_pass2:
+                        from requests.auth import HTTPDigestAuth
+                        snap_r2 = requests.get(snap_url2, auth=HTTPDigestAuth(api_user2, api_pass2),
+                                               verify=False, timeout=snap_timeout)
+                    else:
+                        snap_r2 = requests.get(snap_url2, verify=False, timeout=snap_timeout)
+                    if snap_r2.status_code == 200 and snap_r2.headers.get("Content-Type", "").startswith("image"):
+                        print(f"  ✅  Live snapshot ({label}, retry): {len(snap_r2.content):,} bytes")
+                        return snap_r2.content
+            print(f"  ⚠️   {label} snap retry also failed")
+            return None
+        else:
+            print(f"  ⚠️   {label} snap returned HTTP {snap_r.status_code}")
+            return None
+
+    for conn_type in LIVE_TYPE_CANDIDATES:
+        try:
+            result = _fetch_snap(conn_type)
+            if result:
+                return result
         except Exception as e:
+            label = "local" if conn_type == "LOCAL" else "cloud proxy"
             print(f"  ⚠️   {label} error: {e}")
     return None
 
@@ -1051,7 +1100,7 @@ def cmd_live(cfg: dict, args) -> None:
         for type_val in ["REMOTE", "LOCAL"]:
             r = session.put(
                 url,
-                json={"type": type_val},
+                json={"type": type_val, "highQualityVideo": False},
                 headers={"Content-Type": "application/json"},
                 timeout=15,
             )
@@ -1093,7 +1142,7 @@ def cmd_live(cfg: dict, args) -> None:
                 proxy_host = host_port.split(":")[0]
                 rtsps_url = (
                     f"rtsps://{proxy_host}:443/{hash_path}"
-                    f"/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60"
+                    f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60"
                 )
                 print(f"  📡  RTSPS URL: {rtsps_url}")
                 _open_rtsps_stream(rtsps_url, name, proxy_url, use_vlc=getattr(args, "vlc", False))
@@ -1136,9 +1185,16 @@ def cmd_config(cfg: dict, args) -> None:
 
 
 def cmd_info(cfg: dict, args) -> None:
-    """Show full camera information from the API."""
+    """Show full camera information from the API.
+
+    Usage:
+      python3 bosch_camera.py info           → standard info + stream URLs
+      python3 bosch_camera.py info --full    → also fetch 8 extra endpoints
+                                               (firmware, motion, audio, light, WiFi, etc.)
+    """
     token   = get_token(cfg)
     session = make_session(token)
+    full    = getattr(args, "full", False)
 
     r = session.get(f"{CLOUD_API}/v11/video_inputs", timeout=15)
     if r.status_code == 401:
@@ -1152,6 +1208,7 @@ def cmd_info(cfg: dict, args) -> None:
 
     for cam in cameras:
         name   = cam.get("title", cam.get("id"))
+        cam_id = cam.get("id", "")
         status = cam.get("connectionStatus", "?")
         icon   = "🟢" if status == "ONLINE" else "🔴"
         model  = cam.get("hardwareVersion", "?")
@@ -1165,7 +1222,7 @@ def cmd_info(cfg: dict, args) -> None:
         notif  = cam.get("notificationsEnabledStatus", "?")
 
         print(f"  {icon}  {name}")
-        print(f"      ID:            {cam.get('id')}")
+        print(f"      ID:            {cam_id}")
         print(f"      Model:         {model}   FW: {fw}")
         print(f"      MAC:           {mac}")
         print(f"      Status:        {status}")
@@ -1192,13 +1249,27 @@ def cmd_info(cfg: dict, args) -> None:
               f"follow-up={fst.get('lightOnMotionFollowUpTimeSeconds')}s")
         print(f"      Sound recording: {cam.get('soundIsOnForRecording')}")
 
+        # ── WiFi info (always shown if available) ─────────────────────────
+        try:
+            wr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/wifiinfo", timeout=10)
+            if wr.status_code == 200:
+                wd = wr.json()
+                ssid   = wd.get("ssid", "?")
+                signal = wd.get("signalStrength", wd.get("signal", "?"))
+                ip     = wd.get("ipAddress", wd.get("ip", "?"))
+                mac_w  = wd.get("macAddress", wd.get("mac", "?"))
+                signal_str = f"{signal}%" if isinstance(signal, int) else str(signal)
+                print(f"      WiFi:          {ssid}  signal={signal_str}  IP={ip}  MAC={mac_w}")
+        except Exception:
+            pass
+
         # ── Streaming URLs (live connection) ──────────────────────────────
-        cam_id_local = cam.get("id", "")
+        cam_id_local = cam_id
         print(f"      Fetching stream URLs...")
         try:
             sr = session.put(
                 f"{CLOUD_API}/v11/video_inputs/{cam_id_local}/connection",
-                json={"type": "REMOTE"},
+                json={"type": "REMOTE", "highQualityVideo": False},
                 headers={"Content-Type": "application/json"},
                 timeout=15,
             )
@@ -1211,7 +1282,7 @@ def cmd_info(cfg: dict, args) -> None:
                     hash_path  = u.split("/", 1)[1]
                     snap_url   = sd.get("imageUrlScheme", "https://{url}/snap.jpg").replace("{url}", u)
                     rtsps_url  = (f"rtsps://{proxy_host}:443/{hash_path}"
-                                  f"/rtsp_tunnel?inst=1&enableaudio=1&fmtp=1&maxSessionDuration=60")
+                                  f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60")
                     print(f"      Snap URL:      {snap_url}")
                     print(f"      RTSPS URL:     {rtsps_url}")
                     print(f"      Stream:        H.264 1920×1080 30fps + AAC 16kHz (session ~60s)")
@@ -1219,6 +1290,84 @@ def cmd_info(cfg: dict, args) -> None:
                 print(f"      Stream URLs:   unavailable (HTTP {sr.status_code})")
         except Exception as e:
             print(f"      Stream URLs:   error — {e}")
+
+        # ── Extra endpoints (--full only) ─────────────────────────────────
+        if full:
+            print(f"\n      ── Full details (--full) ───────────────────────────────")
+
+            # /commissioned
+            try:
+                cr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/commissioned", timeout=10)
+                if cr.status_code == 200:
+                    cd = cr.json()
+                    print(f"      Commissioned:  {json.dumps(cd)}")
+            except Exception:
+                pass
+
+            # /firmware
+            try:
+                fwr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/firmware", timeout=10)
+                if fwr.status_code == 200:
+                    fwd = fwr.json()
+                    ver     = fwd.get("version", fwd.get("firmwareVersion", "?"))
+                    up2date = fwd.get("upToDate", fwd.get("isUpToDate", "?"))
+                    print(f"      Firmware:      version={ver}  upToDate={up2date}")
+            except Exception:
+                pass
+
+            # /lighting_override
+            try:
+                lor = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/lighting_override", timeout=10)
+                if lor.status_code == 200:
+                    lod = lor.json()
+                    front = lod.get("frontLightOn", "?")
+                    wall  = lod.get("wallwasherOn", "?")
+                    print(f"      Light override: frontLightOn={front}  wallwasherOn={wall}")
+            except Exception:
+                pass
+
+            # /motion
+            try:
+                mr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion", timeout=10)
+                if mr.status_code == 200:
+                    md = mr.json()
+                    enabled  = md.get("enabled", md.get("motionEnabled", "?"))
+                    sens     = md.get("sensitivity", "?")
+                    print(f"      Motion:        enabled={enabled}  sensitivity={sens}")
+            except Exception:
+                pass
+
+            # /audioAlarm
+            try:
+                ar = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/audioAlarm", timeout=10)
+                if ar.status_code == 200:
+                    ad = ar.json()
+                    enabled   = ad.get("enabled", ad.get("audioAlarmEnabled", "?"))
+                    threshold = ad.get("threshold", ad.get("sensitivity", "?"))
+                    print(f"      Audio alarm:   enabled={enabled}  threshold={threshold}")
+            except Exception:
+                pass
+
+            # /recording_options
+            try:
+                ror = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/recording_options", timeout=10)
+                if ror.status_code == 200:
+                    rod = ror.json()
+                    rec_sound = rod.get("recordSound", rod.get("soundIsOnForRecording", "?"))
+                    print(f"      Recording opts: recordSound={rec_sound}")
+            except Exception:
+                pass
+
+            # /ambient_light_sensor_level
+            try:
+                alr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/ambient_light_sensor_level", timeout=10)
+                if alr.status_code == 200:
+                    ald = alr.json()
+                    level = ald.get("level", ald.get("ambientLightLevel", json.dumps(ald)))
+                    print(f"      Ambient light: level={level}")
+            except Exception:
+                pass
+
         print()
 
 
@@ -1287,8 +1436,14 @@ def cmd_privacy(cfg: dict, args) -> None:
             print(f"  ✅  Already {new_state} — no change needed.")
             continue
 
-        print(f"  🔄  Setting privacy mode → {new_state}...")
-        body = {"privacyMode": new_state, "durationInSeconds": None}
+        minutes = getattr(args, "minutes", None)
+        if new_state == "ON" and minutes:
+            body = {"privacyMode": "ON", "privacyTimeSeconds": int(minutes) * 60}
+            print(f"  🔄  Setting privacy mode → ON for {minutes} minute(s)...")
+        else:
+            body = {"privacyMode": new_state, "durationInSeconds": None}
+            print(f"  🔄  Setting privacy mode → {new_state}...")
+
         pr = session.put(
             f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy",
             json=body,
@@ -1299,7 +1454,10 @@ def cmd_privacy(cfg: dict, args) -> None:
             icon_new = "🔒" if new_state == "ON" else "👁️"
             print(f"  {icon_new}  Privacy mode set to {new_state}.")
             if new_state == "ON":
-                print("     Camera is now blocked — no live images available.")
+                if minutes:
+                    print(f"     Camera is now blocked for {minutes} minute(s).")
+                else:
+                    print("     Camera is now blocked — no live images available.")
             else:
                 print("     Camera is now active — live images available.")
         else:
@@ -1558,8 +1716,16 @@ def cmd_notifications(cfg: dict, args) -> None:
         notif_on = current != "ALWAYS_OFF"
         icon     = "🔔" if notif_on else "🔕"
 
+        # Friendly display for all known states
+        STATE_LABELS = {
+            "ALWAYS_OFF":             "OFF",
+            "FOLLOW_CAMERA_SCHEDULE": "ON (follows schedule)",
+            "ON_CAMERA_SCHEDULE":     "ON (explicit schedule)",
+        }
+        state_label = STATE_LABELS.get(current, current)
+
         print(f"\n── Notifications: {name} ─────────────────────────────────────")
-        print(f"  {icon}  Current state:  {current}")
+        print(f"  {icon}  Current state:  {current}  →  {state_label}")
 
         if action is None:
             print(f"\n  Run with 'on' or 'off' to toggle. E.g.:")
@@ -1567,8 +1733,11 @@ def cmd_notifications(cfg: dict, args) -> None:
             continue
 
         new_status = "FOLLOW_CAMERA_SCHEDULE" if action == "on" else "ALWAYS_OFF"
-        if current == new_status:
-            print(f"  ✅  Already {new_status} — no change needed.")
+        # ON_CAMERA_SCHEDULE also counts as "on" — don't overwrite with FOLLOW_CAMERA_SCHEDULE
+        already_on  = action == "on"  and current in ("FOLLOW_CAMERA_SCHEDULE", "ON_CAMERA_SCHEDULE")
+        already_off = action == "off" and current == "ALWAYS_OFF"
+        if already_on or already_off:
+            print(f"  ✅  Already {current} — no change needed.")
             continue
 
         print(f"  🔄  Setting notifications → {new_status}...")
@@ -1787,14 +1956,16 @@ def cmd_menu(cfg: dict) -> None:
     choice = input("  Enter choice: ").strip()
 
     class A:
-        cam    = None
-        action = None
-        limit  = None
+        cam     = None
+        action  = None
+        limit   = None
         snaps_only  = False
         clips_only  = False
         re_download = False
-        live = False
-        vlc  = False
+        live    = False
+        vlc     = False
+        full    = False
+        minutes = None
 
     a = A()
     try:
@@ -1870,39 +2041,505 @@ def cmd_menu(cfg: dict) -> None:
     input("\n  Press Enter to return to menu...")
 
 def main():
+    # ── Top-level parser ───────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
-        description="Bosch Smart Home Camera — standalone tool",
+        prog="bosch_camera.py",
+        description=(
+            "📷  Bosch Smart Home Camera — standalone control tool  v" + VERSION + "\n"
+            "    Full cloud API access: snapshots, live stream, events, camera controls."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Commands:
-  status               Camera list with ONLINE/OFFLINE status
-  info                 Full camera info + stream URLs
-  snapshot [name]      Save + open latest snapshot (name: partial camera name)
-  live     [name]      Open live stream (audio+video, ffplay by default)
-  download [name]      Bulk download all events (JPEG + MP4)
-  events   [name]      Show recent event list
-  privacy       [name] [on|off]  Show or toggle privacy mode (cloud API, no SHC needed)
-  light         [name] [on|off]  Show or toggle camera light manual override (cloud API)
-  notifications [name] [on|off]  Show or toggle push notifications (cloud API)
-  pan      [name] [left|center|right|<pos>]  Pan 360 camera (-120° to +120°)
-  token         [fix|browser]    Show token status; 'fix' renews silently or via browser
-  config               Show current config file contents
-  rescan               Re-discover cameras and update config
-
-Run without arguments for the interactive menu.
-        """,
+        epilog=(
+            "────────────────────────────────────────────────────────────────\n"
+            "  Run WITHOUT arguments to open the interactive menu.\n"
+            "  Use '<command> --help' for per-command details.\n"
+            "\n"
+            "  Examples:\n"
+            "    python3 bosch_camera.py                          # interactive menu\n"
+            "    python3 bosch_camera.py status\n"
+            "    python3 bosch_camera.py snapshot Garten\n"
+            "    python3 bosch_camera.py snapshot Garten --live\n"
+            "    python3 bosch_camera.py live Kamera --vlc\n"
+            "    python3 bosch_camera.py download Garten --clips-only --limit 20\n"
+            "    python3 bosch_camera.py privacy Garten on --minutes 30\n"
+            "    python3 bosch_camera.py pan Kamera right\n"
+            "    python3 bosch_camera.py pan Kamera 45\n"
+            "    python3 bosch_camera.py token fix\n"
+        ),
     )
-    parser.add_argument("command",        nargs="?",              help="Command")
-    parser.add_argument("cam",            nargs="?",              help="Camera name (partial match)")
-    parser.add_argument("action",         nargs="?",              help="Action for privacy: on / off")
-    parser.add_argument("--limit",        type=int, default=None, help="Max events")
-    parser.add_argument("--snaps-only",   action="store_true",    help="Only JPEG snapshots")
-    parser.add_argument("--clips-only",   action="store_true",    help="Only MP4 clips")
-    parser.add_argument("--re-download",  action="store_true",    help="Re-download existing files")
-    parser.add_argument("--live",         action="store_true",    help="Use live snapshot methods (proxy/local)")
-    parser.add_argument("--vlc",          action="store_true",    help="Open live stream in VLC instead of ffplay")
 
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
+
+    # ── status ─────────────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "status",
+        help="Show all cameras with ONLINE/OFFLINE status",
+        description=(
+            "📶  status — Camera list with ONLINE/OFFLINE status\n"
+            "\n"
+            "  Pings every known camera via the cloud API and prints\n"
+            "  name, model, firmware version, MAC address and status."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="  Example:\n    python3 bosch_camera.py status",
+    )
+
+    # ── info ───────────────────────────────────────────────────────────────────
+    p_info = subparsers.add_parser(
+        "info",
+        help="Full camera details + live stream URLs",
+        description=(
+            "ℹ️   info — Full camera details + live stream URLs\n"
+            "\n"
+            "  Fetches the complete camera object from the cloud API:\n"
+            "  privacy mode, recording state, notifications, features,\n"
+            "  WiFi signal, and the live RTSPS/snap URLs.\n"
+            "\n"
+            "  With --full: also queries 6 extra endpoints\n"
+            "  (firmware, motion, audio alarm, lighting override,\n"
+            "   recording options, ambient light sensor)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py info\n"
+            "    python3 bosch_camera.py info --full"
+        ),
+    )
+    p_info.add_argument(
+        "--full",
+        action="store_true",
+        help="Also fetch extra endpoints: firmware, motion, audio alarm, ambient light, WiFi",
+    )
+
+    # ── snapshot ───────────────────────────────────────────────────────────────
+    p_snap = subparsers.add_parser(
+        "snapshot",
+        help="Save + open a camera snapshot",
+        description=(
+            "📸  snapshot — Save and open a camera snapshot\n"
+            "\n"
+            "  Default (no --live): fetches the latest motion-triggered\n"
+            "  event snapshot from the cloud events API.\n"
+            "\n"
+            "  With --live: tries real-time methods in order:\n"
+            "    1. Cloud proxy live snap  (~1.5 s, no credentials needed)\n"
+            "    2. Local camera snap.jpg  (LAN, requires local_ip + creds in config)\n"
+            "    3. Latest event snapshot  (fallback)\n"
+            "\n"
+            "  Aliases: liveshot / livesnap / live-snapshot  (imply --live)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py snapshot\n"
+            "    python3 bosch_camera.py snapshot Garten\n"
+            "    python3 bosch_camera.py snapshot Garten --live\n"
+            "    python3 bosch_camera.py liveshot Kamera"
+        ),
+    )
+    p_snap.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_snap.add_argument(
+        "--live",
+        action="store_true",
+        help="Prefer live snapshot methods (cloud proxy or local LAN) over event snapshot",
+    )
+
+    # ── liveshot aliases ───────────────────────────────────────────────────────
+    for _alias in ("liveshot", "livesnap", "live-snapshot"):
+        p_alias = subparsers.add_parser(
+            _alias,
+            help=f"Alias for 'snapshot --live'",
+            description=f"📸  {_alias} — Alias for: snapshot --live\n\nSee 'snapshot --help' for full details.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        p_alias.add_argument("cam", nargs="?", metavar="<camera>",
+                             help="Camera name or partial match")
+        p_alias.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
+
+    # ── live ───────────────────────────────────────────────────────────────────
+    p_live = subparsers.add_parser(
+        "live",
+        help="Open live audio+video stream (ffplay / VLC)",
+        description=(
+            "📺  live — Open live audio+video stream\n"
+            "\n"
+            "  Opens an RTSPS stream (H.264 1920×1080 30fps + AAC audio)\n"
+            "  via the Bosch cloud proxy (port 443, TLS).\n"
+            "\n"
+            "  Default player: ffplay (recommended — supports TLS cert skip).\n"
+            "  --vlc: pipes the stream through ffmpeg → VLC stdin (macOS only).\n"
+            "\n"
+            "  Alias: stream\n"
+            "\n"
+            "  Requirements:\n"
+            "    brew install ffmpeg      # for ffplay (default)\n"
+            "    brew install --cask vlc  # for --vlc mode"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py live\n"
+            "    python3 bosch_camera.py live Kamera\n"
+            "    python3 bosch_camera.py live Garten --vlc"
+        ),
+    )
+    p_live.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = first camera)",
+    )
+    p_live.add_argument(
+        "--vlc",
+        action="store_true",
+        help="Open in VLC via ffmpeg pipe instead of ffplay (macOS only)",
+    )
+
+    # stream alias
+    p_stream = subparsers.add_parser(
+        "stream",
+        help="Alias for 'live'",
+        description="📺  stream — Alias for: live\n\nSee 'live --help' for full details.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_stream.add_argument("cam", nargs="?", metavar="<camera>",
+                          help="Camera name or partial match")
+    p_stream.add_argument("--vlc", action="store_true",
+                          help="Open in VLC via ffmpeg pipe instead of ffplay")
+
+    # ── download ───────────────────────────────────────────────────────────────
+    p_dl = subparsers.add_parser(
+        "download",
+        help="Bulk-download all events (JPEG snapshots + MP4 clips)",
+        description=(
+            "💾  download — Bulk-download all events\n"
+            "\n"
+            "  Downloads every event's JPEG snapshot and MP4 video clip\n"
+            "  from the cloud events API into a per-camera subfolder.\n"
+            "\n"
+            "  Already-downloaded files are skipped by default.\n"
+            "  Only clips with videoClipUploadStatus=Done are downloaded."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py download\n"
+            "    python3 bosch_camera.py download Garten\n"
+            "    python3 bosch_camera.py download Garten --limit 50\n"
+            "    python3 bosch_camera.py download Garten --clips-only\n"
+            "    python3 bosch_camera.py download --snaps-only --re-download"
+        ),
+    )
+    p_dl.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_dl.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum number of events to process (default: all)",
+    )
+    p_dl.add_argument(
+        "--snaps-only",
+        action="store_true",
+        help="Download only JPEG snapshots, skip MP4 clips",
+    )
+    p_dl.add_argument(
+        "--clips-only",
+        action="store_true",
+        help="Download only MP4 video clips, skip JPEG snapshots",
+    )
+    p_dl.add_argument(
+        "--re-download",
+        action="store_true",
+        help="Re-download files that already exist locally",
+    )
+
+    # ── events ─────────────────────────────────────────────────────────────────
+    p_ev = subparsers.add_parser(
+        "events",
+        help="Show recent event list (timestamps, types, status)",
+        description=(
+            "📋  events — Show recent event list\n"
+            "\n"
+            "  Lists the most recent motion/alarm events for a camera.\n"
+            "  Each row shows: timestamp, event type, and whether\n"
+            "  a snapshot (📸) or video clip (🎬) is available."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py events\n"
+            "    python3 bosch_camera.py events Garten\n"
+            "    python3 bosch_camera.py events Garten --limit 50"
+        ),
+    )
+    p_ev.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_ev.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of events to show (default: 10)",
+    )
+
+    # ── privacy ────────────────────────────────────────────────────────────────
+    p_priv = subparsers.add_parser(
+        "privacy",
+        help="Show or toggle privacy mode (cloud API, no SHC needed)",
+        description=(
+            "🔒  privacy — Show or toggle privacy mode\n"
+            "\n"
+            "  Uses the Bosch cloud API directly — no SHC local API needed.\n"
+            "  API: PUT /v11/video_inputs/{id}/privacy\n"
+            "\n"
+            "  States:\n"
+            "    ON  — camera is blocked, no live images available\n"
+            "    OFF — camera is active, live images available\n"
+            "\n"
+            "  With --minutes: sets a timed privacy period (auto-expires)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py privacy                    # show all\n"
+            "    python3 bosch_camera.py privacy Garten             # show one\n"
+            "    python3 bosch_camera.py privacy on                 # ON (all cameras)\n"
+            "    python3 bosch_camera.py privacy Garten on\n"
+            "    python3 bosch_camera.py privacy Garten off\n"
+            "    python3 bosch_camera.py privacy Garten on --minutes 30"
+        ),
+    )
+    p_priv.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_priv.add_argument(
+        "action",
+        nargs="?",
+        metavar="on|off",
+        choices=["on", "off"],
+        help="Set privacy mode: on or off",
+    )
+    p_priv.add_argument(
+        "--minutes",
+        type=int,
+        default=None,
+        metavar="N",
+        help="(with 'on') Enable privacy for N minutes, then auto-disable",
+    )
+
+    # ── light ──────────────────────────────────────────────────────────────────
+    p_light = subparsers.add_parser(
+        "light",
+        help="Show or toggle camera light manual override (outdoor camera only)",
+        description=(
+            "💡  light — Show or toggle camera light manual override\n"
+            "\n"
+            "  Controls the built-in LED/wallwasher light of outdoor cameras.\n"
+            "  Only available for cameras with featureSupport.light = true.\n"
+            "  Uses the Bosch cloud API — no SHC local API needed.\n"
+            "  API: PUT /v11/video_inputs/{id}/lighting_override\n"
+            "\n"
+            "  Shows current schedule mode, intensity, and motion-triggered\n"
+            "  light settings when called without on/off."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py light                  # show all\n"
+            "    python3 bosch_camera.py light Garten           # show one\n"
+            "    python3 bosch_camera.py light on               # ON (all cameras)\n"
+            "    python3 bosch_camera.py light Garten on\n"
+            "    python3 bosch_camera.py light Garten off"
+        ),
+    )
+    p_light.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_light.add_argument(
+        "action",
+        nargs="?",
+        metavar="on|off",
+        choices=["on", "off"],
+        help="Turn light override on or off",
+    )
+
+    # ── notifications ──────────────────────────────────────────────────────────
+    p_notif = subparsers.add_parser(
+        "notifications",
+        help="Show or toggle push notifications (cloud API)",
+        description=(
+            "🔔  notifications — Show or toggle push notifications\n"
+            "\n"
+            "  Uses the Bosch cloud API.\n"
+            "  API: PUT /v11/video_inputs/{id}/enable_notifications\n"
+            "\n"
+            "  States:\n"
+            "    on  → FOLLOW_CAMERA_SCHEDULE (follows app schedule)\n"
+            "    off → ALWAYS_OFF"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py notifications\n"
+            "    python3 bosch_camera.py notifications Garten\n"
+            "    python3 bosch_camera.py notifications on\n"
+            "    python3 bosch_camera.py notifications Garten off"
+        ),
+    )
+    p_notif.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_notif.add_argument(
+        "action",
+        nargs="?",
+        metavar="on|off",
+        choices=["on", "off"],
+        help="Enable or disable push notifications",
+    )
+
+    # ── pan ────────────────────────────────────────────────────────────────────
+    p_pan = subparsers.add_parser(
+        "pan",
+        help="Pan the 360 indoor camera (±120°)",
+        description=(
+            "↔️   pan — Pan the 360 indoor camera\n"
+            "\n"
+            "  Controls the pan position of the indoor 360 camera.\n"
+            "  Only available for cameras with featureSupport.panLimit > 0.\n"
+            "  API: PUT /v11/video_inputs/{id}/pan\n"
+            "       Body: {\"absolutePosition\": <degrees>}\n"
+            "\n"
+            "  Presets:\n"
+            "    left   →  -120° (full left)\n"
+            "    center →    0°  (center)\n"
+            "    right  → +120°  (full right)\n"
+            "\n"
+            "  Or pass any integer in range -panLimit to +panLimit."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py pan                    # show position\n"
+            "    python3 bosch_camera.py pan Kamera             # show position\n"
+            "    python3 bosch_camera.py pan left               # full left\n"
+            "    python3 bosch_camera.py pan Kamera center\n"
+            "    python3 bosch_camera.py pan Kamera right\n"
+            "    python3 bosch_camera.py pan Kamera 45\n"
+            "    python3 bosch_camera.py pan Kamera -90"
+        ),
+    )
+    p_pan.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all 360 cameras)",
+    )
+    p_pan.add_argument(
+        "action",
+        nargs="?",
+        metavar="left|center|right|<degrees>",
+        help="Target position: preset (left/center/right) or angle in degrees",
+    )
+
+    # ── token ──────────────────────────────────────────────────────────────────
+    p_tok = subparsers.add_parser(
+        "token",
+        help="Show token status and optionally renew",
+        description=(
+            "🔑  token — Show OAuth2 token status and optionally renew\n"
+            "\n"
+            "  Decodes the JWT access token and shows expiry time,\n"
+            "  account email, and refresh token status.\n"
+            "\n"
+            "  Actions:\n"
+            "    fix      → renew silently via refresh_token (or browser if needed)\n"
+            "    refresh  → same as fix\n"
+            "    browser  → force a new browser login (ignores saved refresh_token)\n"
+            "\n"
+            "  The refresh_token enables silent renewal indefinitely\n"
+            "  (set up once via: python3 get_token.py)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py token\n"
+            "    python3 bosch_camera.py token fix\n"
+            "    python3 bosch_camera.py token browser"
+        ),
+    )
+    p_tok.add_argument(
+        "cam",
+        nargs="?",
+        metavar="fix|refresh|browser",
+        help="Action: 'fix' or 'refresh' = silent renewal; 'browser' = force login",
+    )
+
+    # ── config ─────────────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "config",
+        help="Show current config file (tokens masked)",
+        description=(
+            "⚙️   config — Show current config file\n"
+            "\n"
+            "  Prints bosch_config.json with tokens truncated for security.\n"
+            "  Also shows the current token expiry."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="  Example:\n    python3 bosch_camera.py config",
+    )
+
+    # ── rescan ─────────────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "rescan",
+        help="Re-discover cameras from API and update config",
+        description=(
+            "🔍  rescan — Re-discover cameras\n"
+            "\n"
+            "  Calls GET /v11/video_inputs, updates the cameras section\n"
+            "  in bosch_config.json, and optionally prompts for local IPs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="  Example:\n    python3 bosch_camera.py rescan",
+    )
+
+    # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
+
+    # Provide sensible defaults for attributes that some subparsers don't define,
+    # so all cmd_* functions can safely use getattr(args, "...", default).
+    _defaults = dict(
+        cam=None, action=None, limit=None,
+        snaps_only=False, clips_only=False, re_download=False,
+        live=False, vlc=False, full=False, minutes=None,
+    )
+    for _k, _v in _defaults.items():
+        if not hasattr(args, _k):
+            setattr(args, _k, _v)
 
     # Load (or create) config
     cfg = load_config()
@@ -1921,19 +2558,21 @@ Run without arguments for the interactive menu.
         return
 
     cmd = args.command.lower()
-    # liveshot is an alias for snapshot --live
+    # liveshot / livesnap / live-snapshot are aliases for snapshot --live
     if cmd in ("liveshot", "livesnap", "live-snapshot"):
         args.live = True
         cmd = "snapshot"
+    # stream is an alias for live
+    if cmd == "stream":
+        cmd = "live"
 
     dispatch = {
-        "status":   cmd_status,
-        "info":     cmd_info,
-        "snapshot": cmd_snapshot,
-        "live":     cmd_live,
-        "stream":   cmd_live,
-        "download": cmd_download,
-        "events":   cmd_events,
+        "status":        cmd_status,
+        "info":          cmd_info,
+        "snapshot":      cmd_snapshot,
+        "live":          cmd_live,
+        "download":      cmd_download,
+        "events":        cmd_events,
         "privacy":       cmd_privacy,
         "light":         cmd_light,
         "pan":           cmd_pan,
