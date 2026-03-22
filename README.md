@@ -1,8 +1,8 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, and RCP protocol reads — all from the command line.
-> No official API. No app needed after setup. **v1.5.0**
+> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, RCP protocol reads, and real-time event watching — all from the command line.
+> No official API. No app needed after setup. **v1.6.0**
 
 ---
 
@@ -60,6 +60,10 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Push notifications — on/off** | `notifications [cam] [on\|off]` |
 | **Pan 360 camera** | `pan [cam] [left\|center\|right\|<-120..120>]` |
 | **RCP reads via cloud proxy** | `rcp [cam] <info\|clock\|snapshot\|alarms\|...>` |
+| **Real-time event watching** | `watch [cam] [--interval N] [--duration N]` |
+| **Motion detection — get/set** | `motion [cam] [--enable\|--disable] [--sensitivity S]` |
+| **Audio alarm — get/set** | `audio-alarm [cam] [--enable\|--disable] [--threshold N]` |
+| **Recording options — sound on/off** | `recording [cam] [--sound-on\|--sound-off]` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
 
@@ -188,6 +192,30 @@ python3 bosch_camera.py rcp Outdoor iva          # IVA rule types + resiMotion c
 python3 bosch_camera.py rcp Outdoor bitrate      # bitrate ladder tiers in kbps
 python3 bosch_camera.py rcp Outdoor all          # run all RCP reads
 
+# Watch for new events in real-time
+python3 bosch_camera.py watch                    # all cameras, poll every 30s
+python3 bosch_camera.py watch Garten             # one camera
+python3 bosch_camera.py watch Garten --interval 15  # poll every 15s
+python3 bosch_camera.py watch --duration 600     # stop after 10 minutes
+
+# Motion detection
+python3 bosch_camera.py motion Garten            # show current settings
+python3 bosch_camera.py motion Garten --enable   # enable motion detection
+python3 bosch_camera.py motion Garten --disable  # disable motion detection
+python3 bosch_camera.py motion Garten --enable --sensitivity SUPER_HIGH
+python3 bosch_camera.py motion Garten --sensitivity MEDIUM
+
+# Audio alarm
+python3 bosch_camera.py audio-alarm Garten       # show current settings
+python3 bosch_camera.py audio-alarm Garten --enable  # enable audio alarm
+python3 bosch_camera.py audio-alarm Garten --disable # disable audio alarm
+python3 bosch_camera.py audio-alarm Garten --enable --threshold 60
+
+# Recording options
+python3 bosch_camera.py recording Garten         # show current settings
+python3 bosch_camera.py recording Garten --sound-on   # record with audio
+python3 bosch_camera.py recording Garten --sound-off  # record without audio
+
 # Token
 python3 bosch_camera.py token                    # show token info + expiry
 python3 bosch_camera.py token fix                # silent renewal via refresh_token
@@ -197,6 +225,15 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v1.6.0
+
+- **`watch` command**: real-time event polling — polls `GET /v11/events` every N seconds (default 30) and prints new events as they arrive, with type, timestamp, snapshot URL, and clip URL. Supports `--interval N` and `--duration N` (infinite by default). Handles token expiry automatically.
+- **`motion` command**: get or set motion detection settings via `GET/PUT /v11/video_inputs/{id}/motion`. Supports `--enable`, `--disable`, and `--sensitivity OFF|LOW|MEDIUM|HIGH|SUPER_HIGH`.
+- **`audio-alarm` command**: get or set audio alarm settings via `GET/PUT /v11/video_inputs/{id}/audioAlarm`. Supports `--enable`, `--disable`, and `--threshold N` (0–100).
+- **`recording` command**: get or set cloud recording options via `GET/PUT /v11/video_inputs/{id}/recording_options`. Supports `--sound-on` and `--sound-off`.
 
 ---
 
@@ -860,6 +897,151 @@ tool/
 - **VLC needs ffmpeg** — the `live --vlc` option requires ffmpeg to proxy the stream,
   because VLC cannot skip TLS certificate verification for `rtsps://`.
 - **Camera light control** — the `light on/off` command uses `PUT /v11/video_inputs/{id}/lighting_override` (cloud API, no SHC needed). Full light schedule control (time-based scheduling) is only available via the SHC local API with mutual TLS.
+
+---
+
+## Example: Event Monitoring & Automation
+
+### Watch for live events (CLI)
+
+```bash
+# Watch all cameras, print new events every 30 seconds
+python3 bosch_camera.py watch
+
+# Watch only Garten camera, poll every 15 seconds
+python3 bosch_camera.py watch Garten --interval 15
+
+# Watch for 10 minutes then exit
+python3 bosch_camera.py watch --duration 600
+```
+
+Example output:
+```
+Watching 2 camera(s)... (Ctrl+C to stop)
+  [14:32:07] 🚨 MOVEMENT       cam=Garten        2026-03-22T14:32:05Z
+             📸 https://...events/.../snap.jpg
+             🎬 https://...events/.../clip.mp4
+  [14:35:12] 🔊 AUDIO_ALARM    cam=Kamera        2026-03-22T14:35:10Z
+             📸 https://...events/.../snap.jpg
+```
+
+### Motion detection control
+
+```bash
+# Show current motion settings
+python3 bosch_camera.py motion Garten
+
+# Enable motion with max sensitivity
+python3 bosch_camera.py motion Garten --enable --sensitivity SUPER_HIGH
+
+# Lower sensitivity (reduce false alarms)
+python3 bosch_camera.py motion Garten --sensitivity MEDIUM
+```
+
+### Audio alarm control
+
+```bash
+# Show audio alarm settings
+python3 bosch_camera.py audio-alarm Garten
+
+# Enable audio alarm with threshold 60
+python3 bosch_camera.py audio-alarm Garten --enable --threshold 60
+```
+
+### Home Assistant Automation Examples
+
+#### Motion alert with camera snapshot
+
+```yaml
+automation:
+  - alias: "Bosch Garten — Motion Alert"
+    description: "Send push notification with snapshot when motion is detected"
+    trigger:
+      - platform: state
+        entity_id: sensor.bosch_garten_last_event
+    condition:
+      - condition: template
+        value_template: >
+          {{ trigger.to_state.state not in ['unknown', 'unavailable', '']
+             and trigger.to_state.state != trigger.from_state.state }}
+      - condition: template
+        value_template: >
+          {{ state_attr('sensor.bosch_garten_last_event', 'event_type') == 'MOVEMENT' }}
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "🚨 Bewegung — Garten"
+          message: >
+            {{ now().strftime('%H:%M') }} Uhr —
+            {{ state_attr('sensor.bosch_garten_last_event', 'event_type') }}
+          data:
+            image: "{{ state_attr('sensor.bosch_garten_last_event', 'image_url') }}"
+            url: "{{ state_attr('sensor.bosch_garten_last_event', 'video_clip_url') }}"
+```
+
+#### Audio alarm alert
+
+```yaml
+automation:
+  - alias: "Bosch Kamera — Audio Alarm"
+    description: "Notify when audio alarm triggers"
+    trigger:
+      - platform: state
+        entity_id: sensor.bosch_kamera_last_event_type
+        to: "AUDIO_ALARM"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "🔊 Geräusch erkannt — Kamera"
+          message: "Audio-Alarm um {{ now().strftime('%H:%M') }} Uhr"
+```
+
+#### Privacy mode at night
+
+```yaml
+automation:
+  - alias: "Bosch Kamera — Privacy Mode at Night"
+    trigger:
+      - platform: time
+        at: "22:00:00"
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.bosch_kamera_privacy_mode
+
+  - alias: "Bosch Kamera — Privacy Mode Off in Morning"
+    trigger:
+      - platform: time
+        at: "07:00:00"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.bosch_kamera_privacy_mode
+```
+
+#### Camera light on motion after sunset
+
+```yaml
+automation:
+  - alias: "Bosch Garten — Light on Motion After Sunset"
+    trigger:
+      - platform: state
+        entity_id: sensor.bosch_garten_last_event_type
+        to: "MOVEMENT"
+    condition:
+      - condition: sun
+        after: sunset
+        before: sunrise
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.bosch_garten_camera_light
+      - delay:
+          minutes: 5
+      - service: switch.turn_off
+        target:
+          entity_id: switch.bosch_garten_camera_light
+```
 
 ---
 
