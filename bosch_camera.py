@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "2.0.0"
+VERSION     = "3.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1805,6 +1805,214 @@ def cmd_notifications(cfg: dict, args) -> None:
             print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
 
 
+# ── FCM Push constants (from APK analysis) ───────────────────────────────────
+FCM_PROJECT_ID    = "bosch-smart-cameras"
+FCM_APP_ID        = "1:404630424405:android:9e5b6b58e4c70075"
+FCM_API_KEY       = "REDACTED"
+FCM_SENDER_ID     = "404630424405"
+FCM_CRED_KEY      = "_fcm_credentials"  # key in bosch_config.json settings
+
+
+def _send_signal_alert(
+    signal_url: str, sender: str, recipients: list[str],
+    cam_name: str, event_type: str, ts: str,
+    image_url: str = "", token: str = "",
+) -> None:
+    """Send an alert message (with optional snapshot) via signal-cli-rest-api.
+
+    API: POST {signal_url}/v2/send
+    Body: {"message": "...", "number": sender, "recipients": [...], "base64_attachments": [...]}
+    """
+    import base64 as _b64
+
+    msg = f"{cam_name}: {event_type} um {ts}"
+    body: dict = {
+        "message": msg,
+        "number": sender,
+        "recipients": recipients,
+    }
+
+    # Download and attach the event snapshot if available
+    if image_url and token:
+        try:
+            headers = {"Authorization": f"Bearer {token}", "Accept": "*/*"}
+            r = requests.get(image_url, headers=headers, verify=False, timeout=15)
+            if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
+                b64 = _b64.b64encode(r.content).decode()
+                body["base64_attachments"] = [b64]
+        except Exception as e:
+            print(f"             ⚠️  Signal image download failed: {e}")
+
+    try:
+        r = requests.post(
+            f"{signal_url.rstrip('/')}/v2/send",
+            json=body, timeout=15,
+        )
+        if r.status_code in (200, 201):
+            print(f"             📨 Signal alert sent to {', '.join(recipients)}")
+        else:
+            print(f"             ⚠️  Signal send failed: HTTP {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        print(f"             ⚠️  Signal send error: {e}")
+
+
+def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap: bool,
+                    signal_url: str = "", signal_sender: str = "", signal_recipients: list[str] | None = None) -> None:
+    """Watch for events using FCM push notifications instead of polling.
+
+    Near-instant event detection (~2-3s) via Firebase Cloud Messaging.
+    Requires: pip install firebase-messaging
+    """
+    try:
+        import asyncio
+        from firebase_messaging import FcmPushClient, FcmRegisterConfig
+    except ImportError:
+        print("  ❌  firebase-messaging not installed. Install with:")
+        print("      pip3 install firebase-messaging")
+        return
+
+    session_req = make_session(token)
+    cam_ids = {name: info["id"] for name, info in cams.items()}
+
+    # Build baseline
+    last_seen: dict[str, str] = {}
+    print(f"\n  Fetching baseline events...")
+    for name, cam_info in cams.items():
+        events = api_get_events(session_req, cam_info["id"], limit=1)
+        if events:
+            last_seen[name] = events[0].get("id", "")
+        print(f"  {name}: baseline = {last_seen.get(name, '(none)')[:8]}")
+
+    total_new = [0]
+    start_time = [time.time()]
+
+    def on_notification(notification, persistent_id, obj=None):
+        """Called on each FCM push — fetch events for all cameras."""
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        # Re-get token in case it was refreshed
+        tok = cfg["account"].get("bearer_token", token)
+        sess = make_session(tok)
+
+        for name, cam_id in cam_ids.items():
+            try:
+                events = api_get_events(sess, cam_id, limit=5)
+            except Exception:
+                events = []
+            if not events:
+                continue
+
+            baseline = last_seen.get(name, "")
+            new_events = []
+            for ev in events:
+                if ev.get("id", "") == baseline:
+                    break
+                new_events.append(ev)
+
+            for ev in reversed(new_events):
+                etype   = ev.get("eventType", "EVENT")
+                ts      = ev.get("timestamp", "")[:19]
+                img_url = ev.get("imageUrl", "")
+                clip_url = ev.get("videoClipUrl", "")
+                icon    = "🔊" if "AUDIO" in etype else "🚨"
+                print(f"\n  [{now_str}] {icon} {etype:<15s}  cam={name:<12s}  {ts}  (via FCM push)")
+                if img_url:
+                    print(f"             📸 {img_url}")
+                if clip_url:
+                    print(f"             🎬 {clip_url}")
+                total_new[0] += 1
+
+                # Signal alert
+                if signal_url and signal_sender and signal_recipients:
+                    _send_signal_alert(
+                        signal_url, signal_sender, signal_recipients,
+                        name, etype, ts, img_url, tok,
+                    )
+
+                if auto_snap and img_url:
+                    try:
+                        r = sess.get(img_url, verify=False, timeout=15)
+                        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
+                            fname = f"event_{name}_{ts.replace(':', '-')}.jpg"
+                            fpath = os.path.join(BASE_DIR, fname)
+                            with open(fpath, "wb") as f:
+                                f.write(r.content)
+                            print(f"             💾 Saved: {fpath}")
+                            open_file(fpath)
+                    except Exception as e:
+                        print(f"             ⚠️  Snapshot error: {e}")
+
+            if new_events:
+                last_seen[name] = new_events[0].get("id", baseline)
+
+    def on_creds_updated(creds):
+        cfg["settings"][FCM_CRED_KEY] = creds
+        save_config(cfg)
+
+    async def _run():
+        fcm_config = FcmRegisterConfig(
+            project_id=FCM_PROJECT_ID,
+            app_id=FCM_APP_ID,
+            api_key=FCM_API_KEY,
+            messaging_sender_id=FCM_SENDER_ID,
+        )
+
+        saved_creds = cfg.get("settings", {}).get(FCM_CRED_KEY)
+
+        client = FcmPushClient(
+            callback=on_notification,
+            fcm_config=fcm_config,
+            credentials=saved_creds,
+            credentials_updated_callback=on_creds_updated,
+        )
+
+        print(f"\n  🔑  Registering with FCM...")
+        fcm_token = await client.checkin_or_register()
+        print(f"  ✅  FCM Token: {fcm_token[:50]}...")
+
+        # Register with Bosch CBS
+        print(f"  🔗  Registering with Bosch CBS...")
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        r = requests.post(
+            f"{CLOUD_API}/v11/devices",
+            headers=headers,
+            json={"deviceType": "ANDROID", "deviceToken": fcm_token},
+            verify=False, timeout=10,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  Registered with Bosch CBS!")
+        else:
+            print(f"  ⚠️   CBS registration: HTTP {r.status_code} — pushes may not arrive")
+
+        n_cams = len(cams)
+        print(f"\n  📡  Listening for FCM pushes ({n_cams} camera(s))...")
+        print(f"      Near-instant event detection (~2-3s latency)")
+        if duration:
+            print(f"      Will stop after {duration}s.")
+        print(f"      Press Ctrl+C to stop.\n")
+
+        start_time[0] = time.time()
+
+        await client.start()
+
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if duration and (time.time() - start_time[0]) >= duration:
+                    print(f"\n  Duration of {duration}s reached — stopping.")
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await client.stop()
+
+    try:
+        import asyncio
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        elapsed = int(time.time() - start_time[0])
+        print(f"\n\n  Stopped after {elapsed}s. Total new events: {total_new[0]}")
+
+
 def cmd_watch(cfg: dict, args) -> None:
     """
     Watch for new camera events by polling GET /v11/events every N seconds.
@@ -1823,6 +2031,19 @@ def cmd_watch(cfg: dict, args) -> None:
     interval  = getattr(args, "interval", 30) or 30
     duration  = getattr(args, "duration", 0) or 0
     auto_snap = getattr(args, "snapshot", False)
+    use_push  = getattr(args, "push", False)
+    signal_url = getattr(args, "signal", "") or ""
+    signal_sender = getattr(args, "signal_sender", "") or ""
+    signal_recipients_str = getattr(args, "signal_recipients", "") or ""
+    signal_recipients = [r.strip() for r in signal_recipients_str.split(",") if r.strip()] if signal_recipients_str else []
+
+    if signal_url:
+        print(f"  📨  Signal alerts → {signal_url} (sender={signal_sender}, recipients={signal_recipients})")
+
+    if use_push:
+        _watch_fcm_push(cfg, token, cams, duration, auto_snap,
+                        signal_url, signal_sender, signal_recipients)
+        return
 
     # Build initial baseline of seen event IDs per camera
     last_seen: dict[str, str] = {}
@@ -1900,6 +2121,12 @@ def cmd_watch(cfg: dict, args) -> None:
                     if clip_url:
                         print(f"             🎬 {clip_url}")
                     total_new += 1
+                    # Signal alert
+                    if signal_url and signal_sender and signal_recipients:
+                        _send_signal_alert(
+                            signal_url, signal_sender, signal_recipients,
+                            name, etype, ts, img_url, token,
+                        )
                     # Auto-download and open the event snapshot if requested
                     if auto_snap and img_url:
                         try:
@@ -1933,7 +2160,7 @@ def cmd_motion(cfg: dict, args) -> None:
       python3 bosch_camera.py motion [<cam>] --enable           # enable motion
       python3 bosch_camera.py motion [<cam>] --disable          # disable motion
       python3 bosch_camera.py motion [<cam>] --sensitivity S    # set sensitivity
-        Sensitivity values: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH
+        Sensitivity values: OFF | LOW | MEDIUM_LOW | MEDIUM_HIGH | HIGH | SUPER_HIGH
 
     API: GET/PUT /v11/video_inputs/{id}/motion
     """
@@ -2998,6 +3225,73 @@ def cmd_menu(cfg: dict) -> None:
 
     input("\n  Press Enter to return to menu...")
 
+
+def cmd_autofollow(cfg: dict, args) -> None:
+    """Get or set auto-follow for a 360 camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py autofollow [cam-name]        → show current state
+      python3 bosch_camera.py autofollow [cam-name] on     → enable auto-follow
+      python3 bosch_camera.py autofollow [cam-name] off    → disable auto-follow
+
+    API: GET/PUT /v11/video_inputs/{id}/autofollow
+         Body: {"result": true/false}
+         Response: HTTP 204 on success.
+    Only available for cameras with featureSupport.panLimit > 0 (CAMERA_360).
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)
+
+    if cam_arg and cam_arg.lower() in ("on", "off") and action is None:
+        action  = cam_arg.lower()
+        cam_arg = None
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        cam_id    = cam_info["id"]
+        pan_limit = cam_info.get("pan_limit", 0)
+
+        print(f"\n── Auto-Follow: {name} ─────────────────────────────────────")
+        if not pan_limit:
+            print(f"  ℹ️   This camera does not support auto-follow (panLimit=0).")
+            continue
+
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/autofollow", timeout=10)
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch auto-follow state: HTTP {r.status_code}")
+            continue
+        current = r.json().get("result", False)
+        icon = "🎯" if current else "⏸️"
+        print(f"  {icon}  Auto-follow:  {'ENABLED' if current else 'DISABLED'}")
+
+        if action is None:
+            print(f"\n  Run with 'on' or 'off' to toggle. E.g.:")
+            print(f"    python3 bosch_camera.py autofollow {name.lower()} on")
+            continue
+
+        new_state = action == "on"
+        if new_state == current:
+            print(f"  ✅  Already {'ENABLED' if current else 'DISABLED'} — no change needed.")
+            continue
+
+        print(f"  🔄  Setting auto-follow → {'ENABLED' if new_state else 'DISABLED'}...")
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/autofollow",
+            json={"result": new_state},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            icon_new = "🎯" if new_state else "⏸️"
+            print(f"  {icon_new}  Auto-follow {'ENABLED' if new_state else 'DISABLED'}.")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
 def main():
     # ── Top-level parser ───────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
@@ -3605,6 +3899,14 @@ def main():
                          help="Stop after N seconds (default: 0 = infinite)")
     p_watch.add_argument("--snapshot", action="store_true",
                          help="Auto-download and open the event JPEG when a new event arrives")
+    p_watch.add_argument("--push", action="store_true",
+                         help="Use FCM push notifications instead of polling (~2s latency, requires firebase-messaging)")
+    p_watch.add_argument("--signal", metavar="URL",
+                         help="Send alerts to Signal via signal-cli-rest-api (e.g. http://localhost:8080)")
+    p_watch.add_argument("--signal-recipients", metavar="NUMS",
+                         help="Comma-separated Signal recipients (phone numbers, e.g. +491234567890)")
+    p_watch.add_argument("--signal-sender", metavar="NUM",
+                         help="Signal sender number (your registered signal-cli number)")
 
     # ── motion ─────────────────────────────────────────────────────────────────
     p_motion = subparsers.add_parser(
@@ -3616,7 +3918,7 @@ def main():
             "  Reads or writes the motion detection configuration.\n"
             "  API: GET/PUT /v11/video_inputs/{id}/motion\n"
             "\n"
-            "  Sensitivity values: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH"
+            "  Sensitivity values: OFF | LOW | MEDIUM_LOW | MEDIUM_HIGH | HIGH | SUPER_HIGH"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -3632,7 +3934,7 @@ def main():
     p_motion.add_argument("--enable",  action="store_true", help="Enable motion detection")
     p_motion.add_argument("--disable", action="store_true", help="Disable motion detection")
     p_motion.add_argument("--sensitivity",
-                          choices=["OFF", "LOW", "MEDIUM", "HIGH", "SUPER_HIGH"],
+                          choices=["OFF", "LOW", "MEDIUM_LOW", "MEDIUM_HIGH", "HIGH", "SUPER_HIGH"],
                           metavar="S",
                           help="Sensitivity: OFF | LOW | MEDIUM | HIGH | SUPER_HIGH")
 
@@ -3689,6 +3991,19 @@ def main():
     p_rec.add_argument("--sound-off", action="store_true", dest="sound_off",
                        help="Disable sound recording")
 
+    # ── autofollow ─────────────────────────────────────────────────────────────
+    p_af = subparsers.add_parser(
+        "autofollow",
+        help="Get or set auto-follow (360 camera auto-tracks motion)",
+        description=(
+            "Auto-follow makes the indoor 360 camera automatically pan to track\n"
+            "detected motion. Only available for cameras with panLimit > 0."
+        ),
+    )
+    p_af.add_argument("cam", nargs="?", help="Camera name (optional)")
+    p_af.add_argument("action", nargs="?", choices=["on", "off"],
+                      help="on = enable auto-follow, off = disable")
+
     # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -3700,7 +4015,8 @@ def main():
         live=False, vlc=False, full=False, minutes=None,
         interval=30, duration=0,
         enable=False, disable=False, sensitivity=None,
-        threshold=None, sound_on=False, sound_off=False,
+        threshold=None, sound_on=False, sound_off=False, push=False,
+        signal=None, signal_sender=None, signal_recipients=None,
     )
     for _k, _v in _defaults.items():
         if not hasattr(args, _k):
@@ -3746,6 +4062,7 @@ def main():
         "motion":        cmd_motion,
         "audio-alarm":   cmd_audio_alarm,
         "recording":     cmd_recording,
+        "autofollow":    cmd_autofollow,
         "rcp":           cmd_rcp,
         "token":         cmd_token,
         "config":        cmd_config,

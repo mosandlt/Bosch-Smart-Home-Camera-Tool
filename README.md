@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v1.9.0**
+> No official API. No app needed after setup. **v3.0.0**
 
 ---
 
@@ -62,9 +62,12 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Pan 360 camera** | `pan [cam] [left\|center\|right\|<-120..120>]` |
 | **RCP reads via cloud proxy** | `rcp [cam] <info\|clock\|snapshot\|alarms\|...>` |
 | **Real-time event watching** | `watch [cam] [--interval N] [--duration N] [--snapshot]` |
+| **Real-time via FCM push (~2s)** | `watch [cam] --push [--snapshot]` |
+| **Signal alerts with snapshot** | `watch --signal http://signal:8080 --signal-sender +49... --signal-recipients +49...` |
 | **Motion detection — get/set** | `motion [cam] [--enable\|--disable] [--sensitivity S]` |
 | **Audio alarm — get/set** | `audio-alarm [cam] [--enable\|--disable] [--threshold N]` |
 | **Recording options — sound on/off** | `recording [cam] [--sound-on\|--sound-off]` |
+| **Auto-follow — 360 camera motion tracking** | `autofollow [cam] [on\|off]` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
 
