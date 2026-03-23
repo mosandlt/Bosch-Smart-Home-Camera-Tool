@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bosch Smart Home Camera — All-in-one Standalone Tool
-Version: 1.9.0
+Version: 2.0.0
 =====================================================
 No hardcoded camera IDs or credentials.
 All configuration is stored in bosch_config.json (created on first run).
@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "1.9.0"
+VERSION     = "2.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -992,15 +992,6 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
         server.shutdown()
         print(f"\n  ⏹️   Live view stopped.")
 
-
-def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "", use_vlc: bool = False) -> None:
-    """
-    Open live audio+video stream via rtsps:// (RTSP over TLS on port 443).
-    Uses ffplay by default. VLC does not support Bosch's self-signed TLS cert.
-    Falls back to snap.jpg MJPEG loop if no player is available.
-    """
-    ffplay = shutil.which("ffplay") or "/opt/homebrew/bin/ffplay"
-    mpv    = shutil.which("mpv")
 
 def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "", use_vlc: bool = False) -> None:
     """
