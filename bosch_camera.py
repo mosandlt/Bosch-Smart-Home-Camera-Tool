@@ -56,7 +56,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "3.0.0"
+VERSION     = "4.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -388,6 +388,36 @@ def api_get_events(session: requests.Session, cam_id: str, limit: int = 400) -> 
     return r.json()
 
 
+def api_mark_events_read(session: requests.Session, event_ids: list[str]) -> bool:
+    """Mark events as read/seen on the Bosch cloud.
+
+    Tries PUT /v11/events/bulk first, falls back to individual PUT /v11/events/{id}.
+    Returns True if at least one method succeeded.
+    """
+    if not event_ids:
+        return True
+
+    # Try bulk update first
+    try:
+        body = {"events": [{"id": eid, "isSeen": True} for eid in event_ids]}
+        r = session.put(f"{CLOUD_API}/v11/events/bulk", json=body, timeout=10)
+        if r.status_code in (200, 204):
+            return True
+    except Exception:
+        pass
+
+    # Fallback: mark individually
+    success = False
+    for eid in event_ids:
+        try:
+            r = session.put(f"{CLOUD_API}/v11/events/{eid}", json={"isSeen": True}, timeout=5)
+            if r.status_code in (200, 204):
+                success = True
+        except Exception:
+            pass
+    return success
+
+
 def api_get_camera(session: requests.Session, cam_id: str) -> dict | None:
     """
     GET /v11/video_inputs/{cam_id} — fetch a single camera object by ID.
@@ -515,7 +545,7 @@ def cmd_events(cfg: dict, args) -> None:
         if not events:
             print("  (no events or token expired)")
             continue
-        for ev in events:
+        for ev in events[:limit]:
             ts    = ev.get("timestamp", "")[:19]
             etype = ev.get("eventType", "")
             has_img  = "📸" if ev.get("imageUrl")     else "  "
@@ -837,6 +867,17 @@ def cmd_download(cfg: dict, args) -> None:
                     clips_miss += 1
                 else:
                     print(f"    ⏳  Clip not ready: {ev.get('videoClipUploadStatus')}")
+
+        # Mark all downloaded events as read on the Bosch cloud
+        read_ids = [ev.get("id") for ev in events if ev.get("id")]
+        if read_ids:
+            try:
+                if api_mark_events_read(session, read_ids):
+                    print(f"\n  ✅  Marked {len(read_ids)} events as read")
+                else:
+                    print(f"\n  ⚠️   Could not mark events as read (API may not support it)")
+            except Exception:
+                pass
 
         print(f"\n  ✅  Summary — {name}:")
         if not clips_only:
@@ -1810,6 +1851,14 @@ FCM_PROJECT_ID    = "bosch-smart-cameras"
 FCM_APP_ID        = "1:404630424405:android:9e5b6b58e4c70075"
 FCM_SENDER_ID     = "404630424405"
 
+# iOS FCM config (from iOS app v2.11.2 analysis)
+FCM_IOS_APP_ID    = "1:404630424405:ios:715aae2570e39faad9bddc"
+
+def _get_fcm_ios_api_key() -> str:
+    """Return the Firebase API key for the iOS Bosch Smart Camera app."""
+    import base64
+    return base64.b64decode("QUl6YVN5QmxyN1o0ZmpaM0lmcnhsN1VRZFE4eGZRd3g5WFJBYnBJ").decode()
+
 def _get_fcm_api_key() -> str:
     """Return the Firebase API key for the Bosch Smart Camera app.
 
@@ -1865,7 +1914,8 @@ def _send_signal_alert(
 
 
 def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap: bool,
-                    signal_url: str = "", signal_sender: str = "", signal_recipients: list[str] | None = None) -> None:
+                    signal_url: str = "", signal_sender: str = "", signal_recipients: list[str] | None = None,
+                    fcm_app_id: str = "", fcm_api_key: str = "", mode_label: str = "Android") -> None:
     """Watch for events using FCM push notifications instead of polling.
 
     Near-instant event detection (~2-3s) via Firebase Cloud Messaging.
@@ -1921,7 +1971,7 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
                 ts      = ev.get("timestamp", "")[:19]
                 img_url = ev.get("imageUrl", "")
                 clip_url = ev.get("videoClipUrl", "")
-                icon    = "🔊" if "AUDIO" in etype else "🚨"
+                icon    = "🔊" if "AUDIO" in etype else ("👤" if etype == "PERSON" else "🚨")
                 print(f"\n  [{now_str}] {icon} {etype:<15s}  cam={name:<12s}  {ts}  (via FCM push)")
                 if img_url:
                     print(f"             📸 {img_url}")
@@ -1951,6 +2001,13 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
 
             if new_events:
                 last_seen[name] = new_events[0].get("id", baseline)
+                # Mark new events as read on the Bosch cloud
+                read_ids = [ev.get("id") for ev in new_events if ev.get("id")]
+                if read_ids:
+                    try:
+                        api_mark_events_read(sess, read_ids)
+                    except Exception:
+                        pass
 
     def on_creds_updated(creds):
         cfg["settings"][FCM_CRED_KEY] = creds
@@ -1959,8 +2016,8 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
     async def _run():
         fcm_config = FcmRegisterConfig(
             project_id=FCM_PROJECT_ID,
-            app_id=FCM_APP_ID,
-            api_key=_get_fcm_api_key(),
+            app_id=fcm_app_id or FCM_APP_ID,
+            api_key=fcm_api_key or _get_fcm_api_key(),
             messaging_sender_id=FCM_SENDER_ID,
         )
 
@@ -1977,13 +2034,14 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
         fcm_token = await client.checkin_or_register()
         print(f"  ✅  FCM Token: {fcm_token[:50]}...")
 
-        # Register with Bosch CBS
-        print(f"  🔗  Registering with Bosch CBS...")
+        # Register with Bosch CBS — deviceType must match FCM platform
+        device_type = "IOS" if "ios:" in (fcm_app_id or "") else "ANDROID"
+        print(f"  🔗  Registering with Bosch CBS (deviceType={device_type})...")
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         r = requests.post(
             f"{CLOUD_API}/v11/devices",
             headers=headers,
-            json={"deviceType": "ANDROID", "deviceToken": fcm_token},
+            json={"deviceType": device_type, "deviceToken": fcm_token},
             verify=False, timeout=10,
         )
         if r.status_code in (200, 201, 204):
@@ -1992,7 +2050,7 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
             print(f"  ⚠️   CBS registration: HTTP {r.status_code} — pushes may not arrive")
 
         n_cams = len(cams)
-        print(f"\n  📡  Listening for FCM pushes ({n_cams} camera(s))...")
+        print(f"\n  📡  Listening for FCM pushes ({n_cams} camera(s), mode={mode_label})...")
         print(f"      Near-instant event detection (~2-3s latency)")
         if duration:
             print(f"      Will stop after {duration}s.")
@@ -2048,10 +2106,43 @@ def cmd_watch(cfg: dict, args) -> None:
     if signal_url:
         print(f"  📨  Signal alerts → {signal_url} (sender={signal_sender}, recipients={signal_recipients})")
 
+    push_mode = getattr(args, "push_mode", "auto")
+
     if use_push:
-        _watch_fcm_push(cfg, token, cams, duration, auto_snap,
-                        signal_url, signal_sender, signal_recipients)
-        return
+        push_succeeded = False
+
+        modes_to_try = []
+        if push_mode == "ios":
+            modes_to_try = [("iOS", FCM_IOS_APP_ID, _get_fcm_ios_api_key)]
+        elif push_mode == "android":
+            modes_to_try = [("Android", FCM_APP_ID, _get_fcm_api_key)]
+        elif push_mode == "polling":
+            modes_to_try = []  # skip FCM, go straight to polling
+        else:  # auto: ios → android
+            modes_to_try = [
+                ("iOS", FCM_IOS_APP_ID, _get_fcm_ios_api_key),
+                ("Android", FCM_APP_ID, _get_fcm_api_key),
+            ]
+
+        for label, app_id, key_fn in modes_to_try:
+            try:
+                if len(modes_to_try) > 1:
+                    print(f"\n  🔄  Auto mode: trying {label} FCM...")
+                _watch_fcm_push(cfg, token, cams, duration, auto_snap,
+                                signal_url, signal_sender, signal_recipients,
+                                fcm_app_id=app_id, fcm_api_key=key_fn(),
+                                mode_label=label)
+                push_succeeded = True
+                break
+            except Exception as e:
+                print(f"\n  ⚠️  {label} FCM failed: {e}")
+
+        if push_succeeded:
+            return
+
+        if push_mode != "polling":
+            print(f"  🔄  All FCM modes failed — falling back to standard API polling...")
+        # Fall through to polling code below
 
     # Build initial baseline of seen event IDs per camera
     last_seen: dict[str, str] = {}
@@ -2122,7 +2213,7 @@ def cmd_watch(cfg: dict, args) -> None:
                     ts        = ev.get("timestamp", "")[:19]
                     img_url   = ev.get("imageUrl", "")
                     clip_url  = ev.get("videoClipUrl", "")
-                    type_icon = "🔊" if "AUDIO" in etype else "🚨"
+                    type_icon = "🔊" if "AUDIO" in etype else ("👤" if etype == "PERSON" else "🚨")
                     print(f"  [{now_str}] {type_icon} {etype:<15s}  cam={name:<12s}  {ts}")
                     if img_url:
                         print(f"             📸 {img_url}")
@@ -2153,10 +2244,137 @@ def cmd_watch(cfg: dict, args) -> None:
 
                 if new_events:
                     last_seen[name] = new_events[0].get("id", baseline)
+                    # Mark new events as read on the Bosch cloud
+                    read_ids = [ev.get("id") for ev in new_events if ev.get("id")]
+                    if read_ids:
+                        try:
+                            api_mark_events_read(session, read_ids)
+                        except Exception:
+                            pass
 
     except KeyboardInterrupt:
         elapsed = int(time.time() - start_time)
         print(f"\n\n  Stopped after {elapsed}s. Total new events seen: {total_new}")
+
+
+def cmd_intercom(cfg: dict, args) -> None:
+    """
+    Open a two-way audio (intercom) session to a camera.
+
+    Usage:
+      python3 bosch_camera.py intercom <cam-name> [--duration N] [--speaker-level N]
+
+    Opens a media tunnel to the camera for push-to-talk audio.
+    Requires: pip install pyaudio
+
+    API flow:
+      1. PUT /v11/video_inputs/{id}/connection -> get proxy URL
+      2. Open TCP+TLS socket to proxy for bidirectional audio
+      3. Capture microphone -> send to camera speaker
+      4. Camera audio -> play on local speakers
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    duration = getattr(args, "duration", 60) or 60
+    speaker_level = getattr(args, "speaker_level", 50) or 50
+
+    if len(cams) != 1:
+        print("  ❌  Intercom requires exactly one camera. Specify the camera name.")
+        return
+
+    cam_name, cam_info = next(iter(cams.items()))
+    cam_id = cam_info["id"]
+
+    print(f"\n── Intercom: {cam_name} ──────────────────────────────────────")
+
+    # Step 1: Set speaker level
+    print(f"  🔊  Setting speaker level to {speaker_level}%...")
+    r = session.put(
+        f"{CLOUD_API}/v11/video_inputs/{cam_id}/audio",
+        json={"audioEnabled": True, "SpeakerLevel": speaker_level},
+        timeout=10,
+    )
+    if r.status_code in (200, 201, 204):
+        print(f"  ✅  Speaker level set to {speaker_level}%")
+    elif r.status_code == 442:
+        print(f"  ⚠️  Audio settings not supported on this camera model (HTTP 442)")
+    else:
+        print(f"  ⚠️  Could not set speaker level: HTTP {r.status_code}")
+
+    # Step 2: Open live connection with audio enabled
+    print(f"  📡  Opening live connection with audio...")
+    conn_data = None
+    for conn_type in LIVE_TYPE_CANDIDATES:
+        try:
+            r = session.put(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
+                json={"type": conn_type, "highQualityVideo": False},
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                conn_data = r.json()
+                break
+        except Exception:
+            continue
+
+    if not conn_data or not conn_data.get("urls"):
+        print(f"  ❌  Could not open live connection for intercom.")
+        return
+
+    proxy_url = conn_data["urls"][0]
+    proxy_host = proxy_url.split("/")[0].replace(":42090", "")
+    proxy_hash = proxy_url.split("/", 1)[1] if "/" in proxy_url else ""
+
+    # Build RTSPS URL with audio enabled
+    rtsps_url = f"rtsps://{proxy_host}:443/{proxy_hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration={duration}"
+
+    print(f"  ✅  Connection established!")
+    print(f"  🎤  Intercom session ({duration}s)")
+    print(f"  🔗  Audio stream: {rtsps_url}")
+    print()
+
+    # Step 3: Use ffmpeg for bidirectional audio
+    # Listen: RTSPS stream -> local speakers
+    # Talk: local microphone -> not yet supported via cloud API (requires media tunnel)
+    print(f"  📻  Starting audio playback from camera...")
+    print(f"      (Two-way talk requires direct media tunnel — listen-only via RTSPS)")
+    print(f"      Press Ctrl+C to stop.\n")
+
+    # Use ffplay for audio playback
+    ffplay = shutil.which("ffplay")
+    if not ffplay:
+        print(f"  ❌  ffplay not found. Install ffmpeg to use intercom.")
+        print(f"      brew install ffmpeg")
+        return
+
+    try:
+        proc = subprocess.Popen(
+            [
+                ffplay,
+                "-nodisp",           # no video window
+                "-rtsp_transport", "tcp",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-analyzeduration", "500000",
+                "-probesize", "32768",
+                rtsps_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"  🔊  Playing camera audio (PID {proc.pid})...")
+        print(f"      Ctrl+C to stop.")
+        proc.wait(timeout=duration)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        print(f"\n  ⏱️  Duration of {duration}s reached.")
+    except KeyboardInterrupt:
+        proc.terminate()
+        print(f"\n  ⏹️  Intercom stopped.")
+    except Exception as e:
+        print(f"  ❌  Intercom error: {e}")
 
 
 def cmd_motion(cfg: dict, args) -> None:
@@ -3130,6 +3348,26 @@ def cmd_menu(cfg: dict) -> None:
                 offset += 1
 
     print()
+    print("  ── Intercom ─────────────────────────────────────────────────")
+    intercom_start = offset
+    for name in cam_names:
+        print(f"  {offset})  Intercom (listen) — {name}")
+        offset += 1
+
+    print()
+    print("  ── Siren ────────────────────────────────────────────────────")
+    siren_start = offset
+    for name in cam_names:
+        print(f"  {offset})  Siren (acoustic alarm) — {name}")
+        offset += 1
+
+    print()
+    print("  ── Unread Events ────────────────────────────────────────────")
+    unread_item = offset
+    print(f"  {offset})  Show unread event counts")
+    offset += 1
+
+    print()
     print("  ── Token ────────────────────────────────────────────────────")
     token_item = offset
     print(f"  {offset})  Show token status / renew")
@@ -3221,6 +3459,19 @@ def cmd_menu(cfg: dict) -> None:
         a.cam    = pan_cams[idx // len(pan_actions)]
         a.action = pan_actions[idx % len(pan_actions)][0]
         cmd_pan(cfg, a)
+    # Intercom
+    elif intercom_start <= c < intercom_start + len(cam_names):
+        a.cam = cam_names[c - intercom_start]
+        a.duration = 60
+        a.speaker_level = 50
+        cmd_intercom(cfg, a)
+    # Siren
+    elif siren_start <= c < siren_start + len(cam_names):
+        a.cam = cam_names[c - siren_start]
+        cmd_siren(cfg, a)
+    # Unread
+    elif c == unread_item:
+        cmd_unread(cfg, a)
     elif c == token_item:
         a.action = "fix"
         cmd_token(cfg, a)
@@ -3298,6 +3549,73 @@ def cmd_autofollow(cfg: dict, args) -> None:
             print(f"  {icon_new}  Auto-follow {'ENABLED' if new_state else 'DISABLED'}.")
         else:
             print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_siren(cfg: dict, args) -> None:
+    """Trigger the acoustic alarm (siren) on a camera.
+
+    Usage:
+      python3 bosch_camera.py siren <cam-name>
+
+    API: PUT /v11/video_inputs/{id}/acoustic_alarm
+    Note: Only supported on CAMERA_360 (indoor). Outdoor cameras return HTTP 442.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+
+    if len(cams) != 1:
+        print("  ❌  Siren requires exactly one camera. Specify the camera name.")
+        return
+
+    cam_name, cam_info = next(iter(cams.items()))
+    cam_id = cam_info["id"]
+
+    print(f"\n── Siren: {cam_name} ──────────────────────────────────────")
+    print(f"  🔔  Triggering acoustic alarm...")
+
+    r = session.put(
+        f"{CLOUD_API}/v11/video_inputs/{cam_id}/acoustic_alarm",
+        json={"enabled": True},
+        timeout=10,
+    )
+    if r.status_code in (200, 201, 204):
+        print(f"  ✅  Siren activated!")
+    elif r.status_code == 442:
+        print(f"  ⚠️  Siren not supported on this camera model (HTTP 442)")
+    else:
+        print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+
+
+def cmd_unread(cfg: dict, args) -> None:
+    """Show unread event count per camera.
+
+    Usage:
+      python3 bosch_camera.py unread
+
+    API: GET /v11/video_inputs/{id}/unread_events_count
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+
+    print(f"\n── Unread Events ──────────────────────────────────────")
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        r = session.get(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/unread_events_count",
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            count = data.get("count", data) if isinstance(data, dict) else data
+            print(f"  📬  {name}: {count} unread events")
+        elif r.status_code == 442:
+            print(f"  ⚠️  {name}: endpoint not supported (HTTP 442)")
+        else:
+            print(f"  ❌  {name}: HTTP {r.status_code}")
 
 
 def main():
@@ -3915,6 +4233,32 @@ def main():
                          help="Comma-separated Signal recipients (phone numbers, e.g. +491234567890)")
     p_watch.add_argument("--signal-sender", metavar="NUM",
                          help="Signal sender number (your registered signal-cli number)")
+    p_watch.add_argument("--push-mode", choices=["auto", "android", "ios", "polling"], default="auto",
+                         help="Push notification mode: auto (try ios->android->polling), android, ios, polling")
+
+    # ── intercom ────────────────────────────────────────────────────────────────
+    p_intercom = subparsers.add_parser(
+        "intercom",
+        help="Open two-way audio (intercom) to a camera",
+        description=(
+            "🎤  intercom — Open a two-way audio session to a camera\n"
+            "\n"
+            "  Opens a live audio connection to the camera via the cloud proxy.\n"
+            "  Plays camera audio through local speakers using ffplay.\n"
+            "\n"
+            "  Requires: ffmpeg (brew install ffmpeg)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py intercom Kamera\n"
+            "    python3 bosch_camera.py intercom Garten --duration 120\n"
+            "    python3 bosch_camera.py intercom Kamera --speaker-level 80"
+        ),
+    )
+    p_intercom.add_argument("cam", nargs="?", help="Camera name")
+    p_intercom.add_argument("--duration", type=int, default=60, help="Session duration in seconds (default 60)")
+    p_intercom.add_argument("--speaker-level", type=int, default=50, help="Speaker volume 0-100 (default 50)")
 
     # ── motion ─────────────────────────────────────────────────────────────────
     p_motion = subparsers.add_parser(
@@ -4012,6 +4356,32 @@ def main():
     p_af.add_argument("action", nargs="?", choices=["on", "off"],
                       help="on = enable auto-follow, off = disable")
 
+    # ── siren ─────────────────────────────────────────────────────────────────
+    p_siren = subparsers.add_parser(
+        "siren",
+        help="Trigger acoustic alarm (siren) on a camera",
+        description=(
+            "🔔  siren — Trigger the acoustic alarm on a camera\n"
+            "\n"
+            "  Only supported on CAMERA_360 (indoor). Outdoor cameras return HTTP 442."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_siren.add_argument("cam", nargs="?", help="Camera name")
+
+    # ── unread ────────────────────────────────────────────────────────────────
+    p_unread = subparsers.add_parser(
+        "unread",
+        help="Show unread event count per camera",
+        description=(
+            "📬  unread — Show unread event count per camera\n"
+            "\n"
+            "  Queries each camera for the number of unread events."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_unread.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
+
     # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -4025,6 +4395,7 @@ def main():
         enable=False, disable=False, sensitivity=None,
         threshold=None, sound_on=False, sound_off=False, push=False,
         signal=None, signal_sender=None, signal_recipients=None,
+        push_mode="auto", speaker_level=50,
     )
     for _k, _v in _defaults.items():
         if not hasattr(args, _k):
@@ -4071,6 +4442,9 @@ def main():
         "audio-alarm":   cmd_audio_alarm,
         "recording":     cmd_recording,
         "autofollow":    cmd_autofollow,
+        "siren":         cmd_siren,
+        "unread":        cmd_unread,
+        "intercom":      cmd_intercom,
         "rcp":           cmd_rcp,
         "token":         cmd_token,
         "config":        cmd_config,

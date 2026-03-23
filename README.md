@@ -1,8 +1,8 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v3.0.0**
+> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, RCP protocol reads, and real-time event watching — all from the command line.
+> No official API. No app needed after setup. **v4.0.0**
 
 ---
 
@@ -68,6 +68,10 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Audio alarm — get/set** | `audio-alarm [cam] [--enable\|--disable] [--threshold N]` |
 | **Recording options — sound on/off** | `recording [cam] [--sound-on\|--sound-off]` |
 | **Auto-follow — 360 camera motion tracking** | `autofollow [cam] [on\|off]` |
+| **Intercom — listen to camera audio** | `intercom [cam] [--duration N] [--speaker-level N]` |
+| **Siren — trigger acoustic alarm (360 only)** | `siren [cam]` |
+| **Unread events count** | `unread [cam]` |
+| **Push mode selection (auto/iOS/Android/polling)** | `watch --push --push-mode auto\|ios\|android\|polling` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
 
@@ -204,6 +208,22 @@ python3 bosch_camera.py watch                    # all cameras, poll every 30s
 python3 bosch_camera.py watch Garten             # one camera
 python3 bosch_camera.py watch Garten --interval 15  # poll every 15s
 python3 bosch_camera.py watch --duration 600     # stop after 10 minutes
+python3 bosch_camera.py watch --push --push-mode auto      # try iOS first, then Android, then polling
+python3 bosch_camera.py watch --push --push-mode ios       # FCM push via iOS credentials
+python3 bosch_camera.py watch --push --push-mode android   # FCM push via Android credentials
+python3 bosch_camera.py watch --push --push-mode polling   # disable FCM, use periodic polling only
+
+# Intercom (listen to camera audio)
+python3 bosch_camera.py intercom Indoor          # listen for 60s (default)
+python3 bosch_camera.py intercom Outdoor --duration 120    # listen for 2 minutes
+python3 bosch_camera.py intercom Indoor --speaker-level 80 # set camera speaker volume
+
+# Siren — trigger acoustic alarm (CAMERA_360 only)
+python3 bosch_camera.py siren Indoor             # trigger siren on indoor camera
+
+# Unread events count
+python3 bosch_camera.py unread                   # show unread count for all cameras
+python3 bosch_camera.py unread Outdoor            # show unread count for one camera
 
 # Motion detection
 python3 bosch_camera.py motion Garten            # show current settings
@@ -232,6 +252,63 @@ python3 bosch_camera.py token browser            # force new browser login
 python3 bosch_camera.py config                   # show current config
 python3 bosch_camera.py rescan                   # re-discover cameras
 ```
+
+---
+
+## What's New in v4.0.0
+
+**New `intercom` command**
+Listen to camera audio in real-time via the cloud proxy. Opens an RTSPS audio stream through ffplay with configurable duration and speaker volume. Two-way talk (microphone to camera) is not yet supported via the cloud API — listen-only via RTSPS.
+
+```bash
+python3 bosch_camera.py intercom Indoor                    # listen for 60s
+python3 bosch_camera.py intercom Outdoor --duration 120    # listen for 2 minutes
+python3 bosch_camera.py intercom Indoor --speaker-level 80 # set speaker volume 0-100
+```
+
+The intercom command:
+1. Sets the camera speaker level via `PUT /v11/video_inputs/{id}/audio`
+2. Opens a live proxy connection (`PUT /connection`)
+3. Plays the RTSPS audio stream through ffplay (no video window)
+
+**New `siren` command**
+Trigger the acoustic alarm (siren) on a CAMERA_360 indoor camera via `PUT /v11/video_inputs/{id}/acoustic_alarm`. Returns HTTP 442 on outdoor cameras (not supported).
+
+```bash
+python3 bosch_camera.py siren Indoor
+```
+
+**New `unread` command**
+Show the unread event count per camera via `GET /v11/video_inputs/{id}/unread_events_count`.
+
+```bash
+python3 bosch_camera.py unread               # all cameras
+python3 bosch_camera.py unread Outdoor        # single camera
+```
+
+**Person detection icon in output**
+Events with type `PERSON_DETECTED` now show a 👤 icon in `watch` and `events` output, distinguishing them from generic `MOVEMENT` events.
+
+**Mark-as-read**
+Events are automatically marked as read after download (`download` command) or push alert processing (`watch --push`). Uses `PUT /v11/events/bulk` for batch updates and `PUT /v11/events/{id}` for individual events. The `GET /v11/video_inputs/{id}/last_event` endpoint is used as a fast-path to check for new events before fetching the full event list.
+
+**New `--push-mode` flag for `watch --push`**
+Select the FCM push notification mode explicitly instead of relying on auto-detection:
+
+| `--push-mode` | Behavior |
+|---------------|----------|
+| `auto` (default) | Tries iOS first, then Android, then falls back to polling |
+| `ios` | Uses iOS FCM App ID and API key only |
+| `android` | Uses Android FCM App ID and API key only |
+| `polling` | Disables FCM push entirely, uses periodic polling only |
+
+```bash
+python3 bosch_camera.py watch --push --push-mode ios
+python3 bosch_camera.py watch --push --push-mode android
+python3 bosch_camera.py watch --push --push-mode polling
+```
+
+All FCM modes register with the same Firebase project (`bosch-smart-cameras`, Sender ID `404630424405`). The API keys are base64-encoded in the source code. The `polling` mode disables FCM entirely and uses periodic API polling only.
 
 ---
 
@@ -618,66 +695,175 @@ Auth:      Authorization: Bearer {token}
 SSL:       Use verify=False — Bosch uses a private root CA not in the system store
 ```
 
-### All Known Endpoints
+All endpoints below use `{id}` to refer to the camera UUID (e.g. `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+HTTP 442 means "feature not supported on this camera model."
 
-**Account / App**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/protocol_support?protocol=11&client=iphoneV2.11.2` | Protocol version check → `{"supportedProtocol": 11}` |
-| `GET` | `/v11/registration/check` | Logged-in user info: firstName, lastName, email, timeZone, tokenExpirationTime |
-| `GET` | `/v11/feature_flags` | Feature flags for the account |
-| `GET` | `/v11/purchases` | Subscription / purchase info |
-| `GET` | `/v11/contracts?locale=de_DE` | T&C + privacy URLs: tacVersion, tacURL, dpnVersion, dpnURL |
-
-**Camera — list & status**
+### Camera Management
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v11/video_inputs` | List all cameras (id, title, model, firmware, mac, privacyMode) |
 | `GET` | `/v11/video_inputs/{id}` | Single camera details (same shape as list entry) |
-| `GET` | `/v11/video_inputs/{id}/ping` | Returns `"ONLINE"` or `"OFFLINE"` |
+| `GET` | `/v11/video_inputs/{id}/ping` | Camera online status — returns `"ONLINE"` or `"OFFLINE"` |
+| `PUT` | `/v11/video_inputs/{id}/connection` | Open live proxy session (body: `{"type": "REMOTE"}` or `{"type": "LOCAL"}`) |
+| `GET` | `/v11/video_inputs/{id}/commissioned` | Current proxy connection info (read-only, no session opened) |
 
-**Camera — live connection**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v11/video_inputs/{id}/commissioned` | Current live proxy connection info (same shape as `PUT /connection` response) — read-only, no session opened |
-| `PUT` | `/v11/video_inputs/{id}/connection` | Open live proxy connection (body: `{"type": "REMOTE"}` or `{"type": "LOCAL"}`) |
-
-**Camera — events**
+### Privacy & Security
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v11/events?videoInputId={id}` | All events for a camera |
-| `GET` | `/v11/events?videoInputId={id}&limit=N` | Limited event list |
-| `GET` | `{event.imageUrl}` | Download event JPEG snapshot |
-| `GET` | `{event.videoClipUrl}` | Download event MP4 clip |
+| `GET/PUT` | `/v11/video_inputs/{id}/privacy` | Privacy mode ON/OFF (`{"privacyMode": "ON", "durationInSeconds": null}`) |
+| `GET` | `/v11/video_inputs/{id}/privacy_masks` | Privacy mask zones (pixel regions hidden from recording) |
+| `GET/POST` | `/v11/video_inputs/{id}/motion_sensitive_areas` | Motion detection zones (normalized 0.0–1.0 coordinates) |
+| `GET` | `/v11/video_inputs/{id}/sensitive_polygon_zones` | Polygon-based detection zones (Gen2 cameras) |
+| `GET` | `/v11/video_inputs/{id}/private_areas` | Private area zones (Gen2 cameras) |
+| `GET/PUT` | `/v11/video_inputs/{id}/intrusion_detection` | Intrusion detection config (Gen2 cameras) |
 
-**Camera — settings (read)**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v11/video_inputs/{id}/privacy` | Get privacy mode state → `{"privacyMode": "ON"/"OFF"}` |
-| `GET` | `/v11/video_inputs/{id}/firmware` | Returns T&C/privacy info (tacVersion, tacURL, dpnVersion, dpnURL) — label appears to be a Bosch API mislabel |
-| `GET` | `/v11/video_inputs/{id}/lighting_override` | Current manual light override state → `{"frontLightOn": bool, "wallwasherOn": bool}` |
-| `GET` | `/v11/video_inputs/{id}/lighting_options` | Light schedule options |
-| `GET` | `/v11/video_inputs/{id}/ambient_light_sensor_level` | Current ambient light sensor reading |
-| `GET` | `/v11/video_inputs/{id}/motion` | Motion detection settings |
-| `GET` | `/v11/video_inputs/{id}/motion_sensitive_areas` | Configured motion detection zones |
-| `GET` | `/v11/video_inputs/{id}/audioAlarm` | Audio alarm settings |
-| `GET` | `/v11/video_inputs/{id}/recording_options` | Recording settings |
-| `GET` | `/v11/video_inputs/{id}/timestamp` | Camera timestamp / clock info |
-| `GET` | `/v11/video_inputs/{id}/rules` | Automation rules (returns `[]` when none configured) |
-| `GET` | `/v11/video_inputs/{id}/wifiinfo` | WiFi info — returns **HTTP 401** (requires different/elevated auth) |
-
-**Camera — settings (write)**
+### Motion & Audio Detection
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `PUT` | `/v11/video_inputs/{id}/privacy` | Set privacy mode → HTTP 204 on success |
-| `PUT` | `/v11/video_inputs/{id}/lighting_override` | Set manual light override → HTTP 204 on success |
-| `PUT` | `/v11/video_inputs/{id}/enable_notifications` | Set notification schedule → HTTP 204 on success |
+| `GET/PUT` | `/v11/video_inputs/{id}/motion` | Motion detection config — `enabled` (bool), `motionAlarmConfiguration`: `OFF` / `LOW` / `MEDIUM_LOW` / `MEDIUM_HIGH` / `HIGH` / `SUPER_HIGH` |
+| `GET/PUT` | `/v11/video_inputs/{id}/audioAlarm` | Audio alarm — `enabled` (bool), `threshold` (dB 0–100), config: `OFF` or `CUSTOM` |
+| `GET/PUT` | `/v11/video_inputs/{id}/audio` | Audio settings — `audioEnabled` (bool), `SpeakerLevel` (0–100) |
+| `GET/PUT` | `/v11/video_inputs/{id}/audio_detection_config` | Advanced audio detection config (Gen2 cameras) |
+
+### Camera Controls
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/PUT` | `/v11/video_inputs/{id}/pan` | Pan position ±120° — `absolutePosition` (360 camera only, 442 on outdoor) |
+| `GET/PUT` | `/v11/video_inputs/{id}/autofollow` | Auto-follow motion tracking — `{"result": true/false}` (360 camera only, 442 on outdoor) |
+| `GET/PUT` | `/v11/video_inputs/{id}/recording_options` | Recording options — `recordSound` on/off |
+| `PUT` | `/v11/video_inputs/{id}/enable_notifications` | Set notification schedule — `FOLLOW_CAMERA_SCHEDULE` / `ALWAYS_OFF` |
+| `GET/PUT` | `/v11/video_inputs/{id}/notifications` | Per-type notification toggles: trouble, movement, person, audio, cameraAlarm |
+| `GET/PUT` | `/v11/video_inputs/{id}/lens_elevation` | Lens elevation angle (Gen2 cameras) |
+| `GET/PUT` | `/v11/video_inputs/{id}/mounting_height` | Mounting height config (Gen2 cameras) |
+| `GET/PUT` | `/v11/video_inputs/{id}/timestamp` | Time/date overlay on video |
+| `GET/PUT` | `/v11/video_inputs/{id}/privacy_sound` | Audible privacy mode indicator |
+
+### Lighting (Outdoor Camera)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/v11/video_inputs/{id}/lighting_override` | Manual light on/off — `frontLightOn`, `wallwasherOn`, `frontLightIntensity` (0.0–1.0) |
+| `GET/PUT` | `/v11/video_inputs/{id}/lighting_options` | Light schedule config (time-based on/off) |
+| `GET` | `/v11/video_inputs/{id}/ambient_light_sensor_level` | Ambient light sensor reading (%) |
+| `GET/PUT` | `/v11/video_inputs/{id}/ambient_light` | Ambient light detection config |
+| `GET/PUT` | `/v11/video_inputs/{id}/general_light` | General (always-on) light config |
+| `GET/PUT` | `/v11/video_inputs/{id}/motion_light` | Motion-triggered light config |
+| `PUT` | `/v11/video_inputs/{id}/front_light_switch` | Front light toggle |
+| `PUT` | `/v11/video_inputs/{id}/top_down_light_switch` | Top-down (wallwasher) light toggle |
+| `GET` | `/v11/video_inputs/{id}/switches_lights` | All light switch states |
+
+All lighting endpoints return HTTP 442 on the 360 indoor camera.
+
+### Camera Settings
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/PUT` | `/v11/video_inputs/{id}/led_brightness` | Power LED brightness level |
+| `GET` | `/v11/video_inputs/{id}/leds_lighting` | LED lighting state |
+| `PUT` | `/v11/video_inputs/{id}/acoustic_alarm` | Trigger siren / acoustic alarm |
+| `GET` | `/v11/video_inputs/{id}/credentials` | Camera credentials (local access) |
+| `PUT` | `/v11/video_inputs/{id}/hard_reset` | Factory reset camera |
+| `PUT` | `/v11/video_inputs/{id}/soft_reset` | Soft reset camera |
+| `GET` | `/v11/video_inputs/{id}/smart_home_integration` | SHC integration status |
+
+### Events & Clips
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v11/events?videoInputId={id}&limit=N` | Event list for a camera (JPEG + clip URLs, timestamps, types) |
+| `GET` | `/v11/events/{eventId}` | Single event details |
+| `PUT` | `/v11/events/bulk` | Batch update events (mark as read, toggle favorite) |
+| `POST` | `/v11/events/{eventId}/clip_request` | Request clip export for an event |
+| `GET` | `/v11/events/{eventId}/snap` | Event snapshot JPEG |
+| `GET` | `/v11/video_inputs/{id}/last_event` | Latest event for a camera |
+| `GET` | `/v11/video_inputs/{id}/unread_events_count` | Unread event count |
+
+Event types: `MOTION_DETECTED`, `MOVEMENT`, `PERSON_DETECTED`, `AUDIO_ALARM`, `CAMERA_ALARM`, `TROUBLE`
+
+Video clip upload status: `Done` (clip ready), `Unavailable` (not generated), `Pending` (still uploading)
+
+### Firmware & WiFi
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v11/video_inputs/{id}/firmware` | Firmware version + T&C info |
+| `GET` | `/v11/video_inputs/{id}/firmware/info` | Extended firmware info with changelog |
+| `GET` | `/v11/video_inputs/{id}/wifiinfo` | SSID, signal strength, local IP, MAC address |
+| `GET` | `/v11/video_inputs/{id}/wifi_strength` | Signal strength only |
+
+### User & Account
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v11/devices` | Register FCM push token (`{"deviceType": "ANDROID", "deviceToken": "..."}`) |
+| `GET` | `/v11/registration/check` | Logged-in user info + token expiration time |
+| `GET` | `/v11/purchases` | Subscription / purchase status |
+| `GET` | `/v11/contracts?locale=de_DE` | Terms & conditions + privacy policy URLs |
+| `GET` | `/v11/features` | Feature flags for the account |
+| `GET` | `/v11/friends` | Shared camera contacts |
+| `GET` | `/protocol_support?protocol=11` | Protocol version support check |
+| `GET` | `/v11/maintenance` | Backend maintenance status |
+| `GET` | `/v11/state/pre-maintenance` | Server pre-maintenance mode check |
+| `GET` | `/v11/feature_flags` | Feature flags (alternate endpoint) |
+
+### Live Stream URLs (from PUT /connection response)
+
+After `PUT /v11/video_inputs/{id}/connection`, the response contains proxy URLs:
+
+```
+# Snapshot — no auth needed, hash is the credential
+https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/snap.jpg
+
+# Smaller snapshot (1206px wide)
+https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/snap.jpg?JpegSize=1206
+
+# Live RTSPS stream — 30fps H.264 1920x1080 + AAC-LC 16kHz mono
+rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60
+
+# RCP protocol tunnel
+https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/rcp.xml
+```
+
+Port 443 for RTSPS (not 42090). No auth needed — the hash IS the credential. Session lasts ~60 seconds.
+
+Open with:
+```bash
+ffplay -rtsp_transport tcp -tls_verify 0 -i "rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60"
+```
+
+### Push Notification Modes (FCM)
+
+The Bosch Smart Camera app uses Firebase Cloud Messaging for push notifications. Both Android and iOS credentials work with the same Firebase project.
+
+| Mode | App ID | Project |
+|------|--------|---------|
+| **Android** | `1:404630424405:android:9e5b6b58e4c70075` | `bosch-smart-cameras` |
+| **iOS** | `1:404630424405:ios:715aae2570e39faad9bddc` | `bosch-smart-cameras` |
+
+- **GCM Sender ID**: `404630424405`
+- **API keys**: Base64-encoded in the source code (public Bosch app keys, not personal)
+- **Auto mode**: Tries iOS credentials first, then Android, then falls back to polling
+- **Push flow**: Camera → CBS cloud → Firebase FCM → silent push → app/tool polls `GET /v11/events`
+- **Latency**: ~2–3 seconds from camera trigger to push delivery
+
+### Endpoint Availability by Camera Model
+
+| Endpoint | Outdoor (CAMERA_EYES) | Indoor (CAMERA_360) |
+|----------|----------------------|---------------------|
+| `/autofollow` | 442 | read/write |
+| `/pan` | 442 | read/write |
+| `/lighting_override`, `/lighting_options` | read/write | 442 |
+| `/ambient_light_sensor_level` | read | 442 |
+| `/front_light_switch`, `/top_down_light_switch` | write | 442 |
+| All other endpoints | read/write | read/write |
+
+HTTP 442 = feature not supported on this camera model.
+
+---
 
 ### Privacy Mode
 
@@ -751,60 +937,7 @@ Content-Type: application/json
 Current notification state is available in the `GET /v11/video_inputs` response as
 `notificationsEnabledStatus` per camera (e.g. `"ON_CAMERA_SCHEDULE"`, `"ALWAYS_OFF"`).
 
-### Live Proxy Endpoints (after PUT /connection)
-
-```
-# Port 42090 — HTTP only
-https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/snap.jpg
-  → Current camera image (1920×1080 JPEG, no auth needed)
-
-https://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/snap.jpg?JpegSize=1206
-  → Smaller image (1206px wide)
-
-# Port 443 — RTSP/1.0 over TLS  ✅ WORKING
-rtsps://proxy-NN.live.cbs.boschsecurity.com:443/{hash}/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=60
-  → Full 30fps H.264 1920×1080 + AAC 16kHz audio
-  → Open with: ffplay -rtsp_transport tcp -tls_verify 0 -i "rtsps://..."
-  → Or: ffmpeg -rtsp_transport tcp -tls_verify 0 -i "rtsps://..." -c copy out.mkv
-
-# Port 42090 — RTSP tunnel (proprietary, NOT openable with standard players)
-rtsp://proxy-NN.live.cbs.boschsecurity.com:42090/{hash}/rtsp_tunnel?...
-  → Silently drops all connections
-```
-
 ---
-
-## Discovered API Endpoints (v1.2.0)
-
-The following endpoints were discovered via proxy analysis (mitmproxy capture of the Bosch Smart Home Camera app).
-
-### Account / Protocol
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v11/registration/check` | GET | User info + exact token expiration time |
-| `/protocol_support?protocol=11` | GET | Protocol support check |
-| `/v11/state/pre-maintenance` | GET | Server maintenance mode check |
-
-### Per-Camera (GET)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v11/video_inputs/{id}` | GET | Fetch single camera by ID (same shape as list entry) |
-| `/v11/video_inputs/{id}/commissioned` | GET | Pairing/connection status |
-| `/v11/video_inputs/{id}/firmware` | GET | Firmware version + update status |
-| `/v11/video_inputs/{id}/lighting_override` | GET | Current light override state |
-| `/v11/video_inputs/{id}/lighting_options` | GET | Full light schedule config |
-| `/v11/video_inputs/{id}/ambient_light_sensor_level` | GET | Ambient light sensor reading |
-| `/v11/video_inputs/{id}/motion` | GET | Motion detection on/off + sensitivity |
-| `/v11/video_inputs/{id}/motion_sensitive_areas` | GET | Motion zones (normalized rect coords) |
-| `/v11/video_inputs/{id}/audioAlarm` | GET | Audio alarm threshold + config |
-| `/v11/video_inputs/{id}/recording_options` | GET | Sound-in-recording setting |
-| `/v11/video_inputs/{id}/timestamp` | GET | Timestamp overlay on/off |
-| `/v11/video_inputs/{id}/wifiinfo` | GET | WiFi SSID, signal strength, local IP, MAC |
-| `/v11/video_inputs/{id}/rules` | GET | Camera automation rules |
-
-All of these are accessible via `info --full` (except `wifiinfo` which is shown by default in `info`).
 
 ### RCP via Cloud Proxy
 
@@ -961,9 +1094,13 @@ Watching 2 camera(s)... (Ctrl+C to stop)
   [14:32:07] 🚨 MOVEMENT       cam=Garten        2026-03-22T14:32:05Z
              📸 https://...events/.../snap.jpg
              🎬 https://...events/.../clip.mp4
+  [14:33:45] 👤 PERSON_DETECTED cam=Garten        2026-03-22T14:33:43Z
+             📸 https://...events/.../snap.jpg
   [14:35:12] 🔊 AUDIO_ALARM    cam=Kamera        2026-03-22T14:35:10Z
              📸 https://...events/.../snap.jpg
 ```
+
+Events are automatically **marked as read** after download or push alert processing (via `PUT /v11/events/bulk` and `PUT /v11/events/{id}`). The person detection icon (👤) is shown for `PERSON_DETECTED` events in both `watch` and `events` output.
 
 ### Motion detection control
 
