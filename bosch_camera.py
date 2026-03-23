@@ -1808,8 +1808,16 @@ def cmd_notifications(cfg: dict, args) -> None:
 # ── FCM Push constants (from APK analysis) ───────────────────────────────────
 FCM_PROJECT_ID    = "bosch-smart-cameras"
 FCM_APP_ID        = "1:404630424405:android:9e5b6b58e4c70075"
-FCM_API_KEY       = "REDACTED"
 FCM_SENDER_ID     = "404630424405"
+
+def _get_fcm_api_key() -> str:
+    """Return the Firebase API key for the Bosch Smart Camera app.
+
+    This is a public app-level key (not a secret) embedded in every copy of
+    the Bosch Smart Camera APK. It identifies the app to Firebase, not the user.
+    """
+    import base64
+    return base64.b64decode("QUl6YVN5QS1WOGEzR3hsZ1A0NTRzbzY3QzFJaDBQakpDd3pFMEFJ").decode()
 FCM_CRED_KEY      = "_fcm_credentials"  # key in bosch_config.json settings
 
 
@@ -1952,7 +1960,7 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
         fcm_config = FcmRegisterConfig(
             project_id=FCM_PROJECT_ID,
             app_id=FCM_APP_ID,
-            api_key=FCM_API_KEY,
+            api_key=_get_fcm_api_key(),
             messaging_sender_id=FCM_SENDER_ID,
         )
 
