@@ -3618,6 +3618,110 @@ def cmd_unread(cfg: dict, args) -> None:
             print(f"  ❌  {name}: HTTP {r.status_code}")
 
 
+def cmd_clip_request(cfg: dict, args) -> None:
+    """Re-request video clip upload from camera local storage.
+
+    Usage:
+      python3 bosch_camera.py clip-request <cam> [--event-id ID]
+      python3 bosch_camera.py clip-request <cam> --last N
+
+    API: POST /v11/events/{eventId}/clip_request
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+
+    event_id  = getattr(args, "event_id", None)
+    last_n    = getattr(args, "last", None)
+
+    if len(cams) != 1 and not event_id:
+        print("❌  Specify a single camera name (or use --event-id directly).")
+        return
+
+    if event_id:
+        # Direct event ID mode — re-request one specific clip
+        print(f"\n── Requesting clip for event {event_id} ──")
+        r = session.post(
+            f"{CLOUD_API}/v11/events/{event_id}/clip_request",
+            timeout=15,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  Clip re-request sent for event {event_id}")
+            print(f"      Status will change to 'Pending' → 'Done' when upload completes.")
+        elif r.status_code == 442:
+            print(f"  ⚠️  Endpoint not supported (HTTP 442)")
+        else:
+            code = ""
+            try:
+                data = r.json()
+                code = f" (error {data.get('errorCode', '')})" if isinstance(data, dict) else ""
+            except Exception:
+                pass
+            print(f"  ❌  HTTP {r.status_code}{code}")
+            if r.status_code == 400:
+                print(f"      Error -353 = clip cannot be requested (recording overwritten or too old)")
+        return
+
+    # Find events with Unavailable clips for the camera
+    name, cam_info = next(iter(cams.items()))
+    cam_id = cam_info["id"]
+    limit  = last_n or 10
+
+    print(f"\n── Checking last {limit} events for {name} ──")
+    r = session.get(
+        f"{CLOUD_API}/v11/events",
+        params={"videoInputId": cam_id, "limit": limit},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        print(f"  ❌  Failed to fetch events: HTTP {r.status_code}")
+        return
+
+    events = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
+    unavailable = [
+        e for e in events
+        if e.get("videoClipUploadStatus") in ("Unavailable", "Failed", None)
+        and e.get("videoClipUrl")
+    ]
+
+    if not unavailable:
+        all_done = [e for e in events if e.get("videoClipUploadStatus") == "Done"]
+        print(f"  ℹ️  No clips with status 'Unavailable' found in last {limit} events.")
+        print(f"      {len(all_done)} clips already uploaded, {len(events) - len(all_done)} without clip URL.")
+        return
+
+    print(f"  Found {len(unavailable)} event(s) with unavailable clips:\n")
+    requested = 0
+    for ev in unavailable:
+        ev_id   = ev.get("id", "?")
+        ev_ts   = ev.get("timestamp", "?")
+        ev_type = ev.get("eventType", "?")
+        status  = ev.get("videoClipUploadStatus", "?")
+
+        print(f"  📹  {ev_ts}  {ev_type}  (status: {status})")
+        r = session.post(
+            f"{CLOUD_API}/v11/events/{ev_id}/clip_request",
+            timeout=15,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"      ✅ Clip re-request sent")
+            requested += 1
+        else:
+            code = ""
+            try:
+                data = r.json()
+                code = f" (error {data.get('errorCode', '')})" if isinstance(data, dict) else ""
+            except Exception:
+                pass
+            print(f"      ❌ HTTP {r.status_code}{code}")
+        time.sleep(DELAY)
+
+    print(f"\n  Done: {requested}/{len(unavailable)} clip(s) re-requested.")
+    if requested > 0:
+        print(f"  Poll with 'events {name}' to check when clips become 'Done'.")
+
+
 def main():
     # ── Top-level parser ───────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
@@ -4382,6 +4486,27 @@ def main():
     )
     p_unread.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
 
+    # ── clip-request ─────────────────────────────────────────────────────────
+    p_clip = subparsers.add_parser(
+        "clip-request",
+        help="Re-request video clip upload from camera local storage",
+        description=(
+            "📹  clip-request — Re-request video clip from camera\n"
+            "\n"
+            "  When an event has videoClipUploadStatus 'Unavailable' (Bosch didn't\n"
+            "  generate the clip), this command tells the camera to re-upload the\n"
+            "  video from its local SD storage.\n"
+            "\n"
+            "  Without --event-id, scans the last N events for unavailable clips.\n"
+            "  Error -353 means the recording is already overwritten on the camera."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_clip.add_argument("cam", nargs="?", help="Camera name")
+    p_clip.add_argument("--event-id", help="Re-request a specific event ID")
+    p_clip.add_argument("--last", type=int, default=10,
+                        help="Check last N events for unavailable clips (default: 10)")
+
     # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -4444,6 +4569,7 @@ def main():
         "autofollow":    cmd_autofollow,
         "siren":         cmd_siren,
         "unread":        cmd_unread,
+        "clip-request":  cmd_clip_request,
         "intercom":      cmd_intercom,
         "rcp":           cmd_rcp,
         "token":         cmd_token,
