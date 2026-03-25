@@ -3,3 +3,4 @@ captures/
 __pycache__/
 *.pyc
 .DS_Store
+_live_stream.m3u
