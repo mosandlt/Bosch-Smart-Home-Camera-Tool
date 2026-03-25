@@ -17,6 +17,10 @@ Usage:
   python3 start_proxy.py --port 9090  # custom port
   python3 start_proxy.py --dump       # save flows to file for later analysis
 
+Flags applied automatically:
+  --ignore-hosts  Apple domains bypassed (certificate pinning blocks iOS traffic otherwise)
+  --ssl-insecure  Accept self-signed certs (Bosch cameras use NXP-BUID self-signed certs)
+
 Then configure your phone's WiFi proxy to point to this Mac.
 See README.md section "Capturing App Traffic with mitmproxy" for full setup.
 """
@@ -140,6 +144,11 @@ def main():
         "--listen-port", str(port),
         "--set", "console_eventlog_verbosity=info",
         "--showhost",
+        # Apple domains use certificate pinning — bypass them
+        "--ignore-hosts",
+        r"(apple\.com|icloud\.com|mzstatic\.com|apple-dns\.net|cdn-apple\.com|push\.apple\.com|itunes\.com)",
+        # Bosch cameras use self-signed NXP-BUID certs
+        "--ssl-insecure",
     ]
 
     if args.dump:

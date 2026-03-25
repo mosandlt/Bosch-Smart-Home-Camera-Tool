@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bosch Smart Home Camera — All-in-one Standalone Tool
-Version: 2.0.0
+Version: 5.0.0
 =====================================================
 No hardcoded camera IDs or credentials.
 All configuration is stored in bosch_config.json (created on first run).
@@ -33,7 +33,13 @@ Usage (CLI):
   python3 bosch_camera.py liveshot [<cam-name>]            # alias: forces live methods
   python3 bosch_camera.py live     [<cam-name>]            # open RTSP stream in VLC
   python3 bosch_camera.py download [<cam-name>] [--limit N] [--snaps-only] [--clips-only]
-  python3 bosch_camera.py events   [<cam-name>] [--limit N]
+  python3 bosch_camera.py events   [<cam-name>] [--limit N] [--clip EVENT_ID]
+  python3 bosch_camera.py privacy-sound [<cam-name>] [on|off]
+  python3 bosch_camera.py rules    [<cam-name>] [add|edit|delete]
+  python3 bosch_camera.py friends  [invite|share|unshare|resend|remove]
+  python3 bosch_camera.py rename   <cam-name> "New Name"
+  python3 bosch_camera.py profile  [edit --display-name NAME --marketing on|off]
+  python3 bosch_camera.py account                          # feature flags, contracts, purchases
   python3 bosch_camera.py config                           # show current config
   python3 bosch_camera.py rescan                           # re-discover cameras
 """
@@ -56,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "4.0.0"
+VERSION     = "5.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -532,12 +538,41 @@ def cmd_status(cfg: dict, args) -> None:
 
 
 def cmd_events(cfg: dict, args) -> None:
-    """Show latest events for a camera."""
+    """Show latest events for a camera.
+
+    With --clip EVENT_ID: download the MP4 video clip for a specific event.
+    """
     token   = get_token(cfg)
     session = make_session(token)
     cameras = get_cameras(cfg, session)
     limit   = getattr(args, "limit", None) or 10
     cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    clip_id = getattr(args, "clip", None)
+
+    # ── Download a specific clip ──────────────────────────────────────────
+    if clip_id:
+        session.headers["Accept"] = "*/*"
+        print(f"\n── Downloading clip for event {clip_id} ──────────────────────")
+        r = session.get(f"{CLOUD_API}/v11/events/{clip_id}/clip.mp4", timeout=120, stream=True)
+        if r.status_code == 200:
+            fn   = f"clip_{clip_id[:8]}.mp4"
+            path = os.path.join(BASE_DIR, fn)
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
+            sz = os.path.getsize(path)
+            szm = f"{sz/1_000_000:.1f} MB" if sz > 1_000_000 else f"{sz:,} bytes"
+            print(f"  🎬  Saved: {path}  ({szm})")
+            open_file(path)
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
 
     for name, cam_info in cams.items():
         print(f"\n── Events: {name} (last {limit}) ────────────────────────────")
@@ -548,10 +583,11 @@ def cmd_events(cfg: dict, args) -> None:
         for ev in events[:limit]:
             ts    = ev.get("timestamp", "")[:19]
             etype = ev.get("eventType", "")
+            ev_id = ev.get("id", "")
             has_img  = "📸" if ev.get("imageUrl")     else "  "
             has_clip = "🎬" if ev.get("videoClipUrl") else "  "
             clip_st  = ev.get("videoClipUploadStatus", "")
-            print(f"  {has_img}{has_clip}  {ts}  {etype:20s}  {clip_st}")
+            print(f"  {has_img}{has_clip}  {ts}  {etype:20s}  {clip_st}  id={ev_id[:8]}")
 
 
 # ══════════════════════════ LIVE SNAPSHOT METHODS ═══════════════════════════
@@ -1449,6 +1485,17 @@ def cmd_info(cfg: dict, args) -> None:
                 if tr.status_code == 200:
                     td = tr.json()
                     print(f"      Timestamp:     overlay={td.get('result', '?')}")
+            except Exception:
+                pass
+
+            # /privacy_sound_override
+            try:
+                psr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy_sound_override", timeout=10)
+                if psr.status_code == 200:
+                    psd = psr.json()
+                    print(f"      Privacy sound: {psd.get('result', '?')}")
+                elif psr.status_code == 442:
+                    print(f"      Privacy sound: not supported (HTTP 442)")
             except Exception:
                 pass
 
@@ -3645,6 +3692,732 @@ def cmd_unread(cfg: dict, args) -> None:
             print(f"  ❌  {name}: HTTP {r.status_code}")
 
 
+def cmd_privacy_sound(cfg: dict, args) -> None:
+    """Get or set privacy sound override for a camera.
+
+    Usage:
+      python3 bosch_camera.py privacy-sound [cam-name]        → show current state
+      python3 bosch_camera.py privacy-sound [cam-name] on     → enable privacy sound
+      python3 bosch_camera.py privacy-sound [cam-name] off    → disable privacy sound
+
+    API: GET/PUT /v11/video_inputs/{id}/privacy_sound_override
+         Body: {"result": true/false}
+         Response: {"result": true/false}
+    When enabled, the camera plays an audible indicator when privacy mode changes.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    action  = getattr(args, "action", None)
+
+    if cam_arg and cam_arg.lower() in ("on", "off") and action is None:
+        action  = cam_arg.lower()
+        cam_arg = None
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Privacy Sound: {name} ─────────────────────────────────────")
+
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy_sound_override", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code == 442:
+            print(f"  ⚠️   Privacy sound not supported on this camera model (HTTP 442)")
+            continue
+        if r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+            continue
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch privacy sound state: HTTP {r.status_code}")
+            continue
+        data    = r.json()
+        current = data.get("result", False)
+        icon    = "🔊" if current else "🔇"
+        print(f"  {icon}  Privacy sound:  {'ENABLED' if current else 'DISABLED'}")
+
+        if action is None:
+            print(f"\n  Run with 'on' or 'off' to toggle. E.g.:")
+            print(f"    python3 bosch_camera.py privacy-sound {name.lower()} on")
+            continue
+
+        new_state = action == "on"
+        if new_state == current:
+            print(f"  ✅  Already {'ENABLED' if current else 'DISABLED'} — no change needed.")
+            continue
+
+        print(f"  🔄  Setting privacy sound → {'ENABLED' if new_state else 'DISABLED'}...")
+        pr = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/privacy_sound_override",
+            json={"result": new_state},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if pr.status_code in (200, 201, 204):
+            icon_new = "🔊" if new_state else "🔇"
+            print(f"  {icon_new}  Privacy sound {'ENABLED' if new_state else 'DISABLED'}.")
+        elif pr.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {pr.json()}")
+            except Exception:
+                print(f"       {pr.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_rules(cfg: dict, args) -> None:
+    """Manage camera automation rules (time-based schedules).
+
+    Usage:
+      python3 bosch_camera.py rules [cam]                                            → list all rules
+      python3 bosch_camera.py rules [cam] add --name NAME --start HH:MM --end HH:MM --days 0,1,2,3,4,5,6
+      python3 bosch_camera.py rules [cam] edit --id RULE_ID --active|--inactive
+      python3 bosch_camera.py rules [cam] delete --id RULE_ID
+
+    API: GET/POST/PUT/DELETE /v11/video_inputs/{id}/rules
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    sub     = getattr(args, "sub", None)
+
+    # Allow "rules add" without camera name
+    RULES_SUBS = ("add", "edit", "delete")
+    if cam_arg and cam_arg.lower() in RULES_SUBS and not sub:
+        sub, cam_arg = cam_arg.lower(), None
+    if sub:
+        sub = sub.lower()
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Rules: {name} ──────────────────────────────────────────────")
+
+        if sub == "add":
+            rule_name = getattr(args, "rule_name", None) or "New Rule"
+            start     = getattr(args, "start", "00:00")
+            end       = getattr(args, "end", "23:59")
+            days_str  = getattr(args, "days", "0,1,2,3,4,5,6")
+            weekdays  = [int(d.strip()) for d in days_str.split(",") if d.strip().isdigit()]
+
+            body = {
+                "id": None,
+                "name": rule_name,
+                "isActive": True,
+                "startTime": f"{start}:00",
+                "endTime": f"{end}:00",
+                "weekdays": weekdays,
+            }
+            print(f"  ➕  Creating rule: {rule_name}")
+            print(f"      Time: {start} → {end}  Days: {weekdays}")
+            r = session.post(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                data = r.json()
+                rule_id = data.get("id", "(unknown)")
+                print(f"  ✅  Rule created: id={rule_id}")
+            elif r.status_code == 444:
+                print(f"  ⚠️   Camera offline or unavailable for this operation")
+                try:
+                    print(f"       {r.json()}")
+                except Exception:
+                    print(f"       {r.text[:200]}")
+            else:
+                print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+            continue
+
+        if sub == "edit":
+            rule_id = getattr(args, "rule_id", None)
+            if not rule_id:
+                print("  ❌  --id is required for edit. Usage: rules [cam] edit --id RULE_ID --active|--inactive")
+                continue
+            active = getattr(args, "active", False)
+            inactive = getattr(args, "inactive", False)
+
+            # Fetch current rule first
+            r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules", timeout=10)
+            if r.status_code != 200:
+                print(f"  ❌  Could not fetch rules: HTTP {r.status_code}")
+                continue
+            rules = r.json()
+            target_rule = None
+            for rule in rules:
+                if rule.get("id") == rule_id:
+                    target_rule = rule
+                    break
+            if not target_rule:
+                print(f"  ❌  Rule ID '{rule_id}' not found.")
+                continue
+
+            if active:
+                target_rule["isActive"] = True
+            if inactive:
+                target_rule["isActive"] = False
+
+            print(f"  ✏️   Updating rule: {rule_id}")
+            pr = session.put(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules/{rule_id}",
+                json=target_rule,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if pr.status_code in (200, 201, 204):
+                print(f"  ✅  Rule updated: isActive={target_rule.get('isActive')}")
+            elif pr.status_code == 444:
+                print(f"  ⚠️   Camera offline or unavailable for this operation")
+                try:
+                    print(f"       {pr.json()}")
+                except Exception:
+                    print(f"       {pr.text[:200]}")
+            else:
+                print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+            continue
+
+        if sub == "delete":
+            rule_id = getattr(args, "rule_id", None)
+            if not rule_id:
+                print("  ❌  --id is required for delete. Usage: rules [cam] delete --id RULE_ID")
+                continue
+            print(f"  🗑️   Deleting rule: {rule_id}")
+            r = session.delete(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules/{rule_id}",
+                timeout=10,
+            )
+            if r.status_code in (200, 204):
+                print(f"  ✅  Rule deleted.")
+            elif r.status_code == 444:
+                print(f"  ⚠️   Camera offline or unavailable for this operation")
+                try:
+                    print(f"       {r.json()}")
+                except Exception:
+                    print(f"       {r.text[:200]}")
+            else:
+                print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+            continue
+
+        # Default: list all rules
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+            continue
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch rules: HTTP {r.status_code}")
+            continue
+        rules = r.json()
+        if not rules:
+            print(f"  (no rules configured)")
+            print(f"\n  Create a rule with:")
+            print(f"    python3 bosch_camera.py rules {name.lower()} add --name 'Night Mode' --start 22:00 --end 06:00 --days 0,1,2,3,4,5,6")
+            continue
+        print(f"  {len(rules)} rule(s):\n")
+        DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for rule in rules:
+            rid    = rule.get("id", "?")
+            rname  = rule.get("name", "?")
+            active = rule.get("isActive", False)
+            start  = rule.get("startTime", "?")
+            end    = rule.get("endTime", "?")
+            days   = rule.get("weekdays", [])
+            days_str = ", ".join(DAY_NAMES[d] if d < len(DAY_NAMES) else str(d) for d in days)
+            icon   = "✅" if active else "⏸️"
+            print(f"  {icon}  {rname}")
+            print(f"      ID:     {rid}")
+            print(f"      Active: {active}")
+            print(f"      Time:   {start} → {end}")
+            print(f"      Days:   {days_str}")
+            print()
+
+
+def cmd_friends(cfg: dict, args) -> None:
+    """Manage camera sharing with friends.
+
+    Usage:
+      python3 bosch_camera.py friends                              → list all friends
+      python3 bosch_camera.py friends invite EMAIL                 → invite a friend
+      python3 bosch_camera.py friends share FRIEND_ID CAM [--days N]
+      python3 bosch_camera.py friends unshare FRIEND_ID
+      python3 bosch_camera.py friends resend FRIEND_ID
+      python3 bosch_camera.py friends remove FRIEND_ID
+
+    API: GET/POST/PUT/DELETE /v11/friends/*
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    sub     = getattr(args, "sub", None)
+    sub_arg = getattr(args, "sub_arg", None)
+
+    print(f"\n── Friends / Camera Sharing ─────────────────────────────────────")
+
+    if sub == "invite":
+        email = sub_arg
+        if not email:
+            print("  ❌  Email is required. Usage: friends invite EMAIL")
+            return
+        body = {"invitationEmail": email, "nickName": email}
+        print(f"  📨  Inviting {email}...")
+        r = session.post(
+            f"{CLOUD_API}/v11/friends",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code in (200, 201):
+            data = r.json()
+            print(f"  ✅  Invitation sent! Friend ID: {data.get('id', '(see response)')}")
+            print(f"      {json.dumps(data, indent=2)}")
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
+
+    if sub == "share":
+        friend_id = sub_arg
+        cam_name  = getattr(args, "share_cam", None)
+        days      = getattr(args, "days", None)
+        if not friend_id or not cam_name:
+            print("  ❌  Usage: friends share FRIEND_ID CAM [--days N]")
+            return
+        target_cams = resolve_cam(cfg, cam_name)
+        if not target_cams:
+            return
+        shares = []
+        for cname, cinfo in target_cams.items():
+            share_entry = {"videoInputId": cinfo["id"]}
+            if days:
+                now = datetime.datetime.utcnow()
+                end = now + datetime.timedelta(days=days)
+                share_entry["shareTime"] = {
+                    "start": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    "end":   end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                }
+            shares.append(share_entry)
+
+        print(f"  🔗  Sharing {len(shares)} camera(s) with friend {friend_id}...")
+        r = session.put(
+            f"{CLOUD_API}/v11/friends/{friend_id}/share",
+            json=shares,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  Camera(s) shared!")
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
+
+    if sub == "unshare":
+        friend_id = sub_arg
+        if not friend_id:
+            print("  ❌  Usage: friends unshare FRIEND_ID")
+            return
+        print(f"  🔓  Removing all camera shares from friend {friend_id}...")
+        r = session.put(
+            f"{CLOUD_API}/v11/friends/{friend_id}/share",
+            json=[],
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  All cameras unshared.")
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
+
+    if sub == "resend":
+        friend_id = sub_arg
+        if not friend_id:
+            print("  ❌  Usage: friends resend FRIEND_ID")
+            return
+        print(f"  📨  Re-sending invitation to friend {friend_id}...")
+        r = session.put(
+            f"{CLOUD_API}/v11/friends/{friend_id}/resend_invite",
+            json={"email": ""},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  Invitation re-sent!")
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
+
+    if sub == "remove":
+        friend_id = sub_arg
+        if not friend_id:
+            print("  ❌  Usage: friends remove FRIEND_ID")
+            return
+        print(f"  🗑️   Removing friend {friend_id}...")
+        r = session.delete(f"{CLOUD_API}/v11/friends/{friend_id}", timeout=10)
+        if r.status_code in (200, 204):
+            print(f"  ✅  Friend removed.")
+        elif r.status_code == 444:
+            print(f"  ⚠️   Camera offline or unavailable for this operation")
+            try:
+                print(f"       {r.json()}")
+            except Exception:
+                print(f"       {r.text[:200]}")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+        return
+
+    # Default: list all friends
+    r = session.get(f"{CLOUD_API}/v11/friends", timeout=10)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    if r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+        try:
+            print(f"       {r.json()}")
+        except Exception:
+            print(f"       {r.text[:200]}")
+        return
+    if r.status_code != 200:
+        print(f"  ❌  Could not fetch friends: HTTP {r.status_code}")
+        return
+    friends = r.json()
+    if not friends:
+        print(f"  (no friends / camera shares)")
+        print(f"\n  Invite a friend with:")
+        print(f"    python3 bosch_camera.py friends invite user@example.com")
+        return
+    print(f"  {len(friends)} friend(s):\n")
+    for friend in friends:
+        fid    = friend.get("id", "?")
+        email  = friend.get("email", friend.get("invitationEmail", "?"))
+        nick   = friend.get("nickName", "?")
+        status = friend.get("status", friend.get("invitationStatus", "?"))
+        shares = friend.get("sharedVideoInputs", friend.get("shares", []))
+        icon   = "✅" if status in ("ACCEPTED", "ACTIVE") else "⏳"
+        print(f"  {icon}  {nick} ({email})")
+        print(f"      ID:     {fid}")
+        print(f"      Status: {status}")
+        if shares:
+            print(f"      Shared: {len(shares)} camera(s)")
+            for sh in shares:
+                vid = sh.get("videoInputId", "?")
+                print(f"        • {vid}")
+        print()
+
+
+def cmd_rename(cfg: dict, args) -> None:
+    """Rename a camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py rename CAM "New Name"
+
+    API: PUT /v11/video_inputs
+         Body: {"videoInputId": "uuid", "title": "New Name", "timeZone": "Europe/Berlin"}
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    new_name = getattr(args, "new_name", None)
+
+    if not cam_arg or not new_name:
+        print("  ❌  Usage: rename CAM \"New Name\"")
+        return
+
+    cams = resolve_cam(cfg, cam_arg)
+    if len(cams) != 1:
+        print("  ❌  Rename requires exactly one camera.")
+        return
+
+    name, cam_info = next(iter(cams.items()))
+    cam_id = cam_info["id"]
+
+    print(f"\n── Rename Camera ──────────────────────────────────────────────")
+    print(f"  📷  Camera:    {name}")
+    print(f"  ✏️   New name:  {new_name}")
+
+    body = {
+        "videoInputId": cam_id,
+        "title": new_name,
+        "timeZone": "Europe/Berlin",
+    }
+    r = session.put(
+        f"{CLOUD_API}/v11/video_inputs",
+        json=body,
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    if r.status_code in (200, 201, 204):
+        print(f"  ✅  Camera renamed to '{new_name}'.")
+        # Update local config
+        old_name = name
+        cam_info["name"] = new_name
+        cfg["cameras"][new_name] = cam_info
+        if old_name != new_name and old_name in cfg["cameras"]:
+            del cfg["cameras"][old_name]
+        save_config(cfg)
+        print(f"  💾  Config updated.")
+    elif r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+        try:
+            print(f"       {r.json()}")
+        except Exception:
+            print(f"       {r.text[:200]}")
+    else:
+        print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+
+
+def cmd_profile(cfg: dict, args) -> None:
+    """Show or edit user profile.
+
+    Usage:
+      python3 bosch_camera.py profile                                → show user info
+      python3 bosch_camera.py profile edit --display-name NAME --marketing on|off
+
+    API: GET /v11/registration/check, PUT /v11/registration
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    edit    = getattr(args, "sub", None)
+    display_name = getattr(args, "display_name", None)
+    marketing    = getattr(args, "marketing", None)
+
+    # Allow "profile edit" without the sub argument
+    if edit and edit.lower() == "edit":
+        edit = "edit"
+    elif edit:
+        edit = None
+
+    print(f"\n── User Profile ───────────────────────────────────────────────")
+
+    # Fetch current profile
+    r = session.get(f"{CLOUD_API}/v11/registration/check", timeout=10)
+    if r.status_code == 401:
+        print("  ❌  Token expired.")
+        return
+    if r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+        try:
+            print(f"       {r.json()}")
+        except Exception:
+            print(f"       {r.text[:200]}")
+        return
+    if r.status_code != 200:
+        print(f"  ❌  Could not fetch profile: HTTP {r.status_code}  {r.text[:200]}")
+        return
+    data = r.json()
+    # Response has nested "userInformation" object
+    user_info  = data.get("userInformation", data)
+
+    # Display profile info
+    email      = user_info.get("email", "?")
+    first      = user_info.get("firstName", "")
+    last       = user_info.get("lastName", "")
+    display    = user_info.get("displayName", "?")
+    name       = f"{first} {last}".strip() if first else display
+    last_login = data.get("lastLoginTime", "?")
+    token_exp  = data.get("tokenExpirationTime", "?")
+    mkt        = user_info.get("marketingContact", "?")
+    iot        = user_info.get("iotThingsIntegration", "?")
+    lang       = user_info.get("language", "?")
+    tz         = user_info.get("timeZone", "?")
+    problems   = data.get("loginProblems", [])
+
+    print(f"  👤  Name:           {name} (display: {display})")
+    print(f"  📧  Email:          {email}")
+    print(f"  🌍  Language:       {lang}  /  Timezone: {tz}")
+    print(f"  🕐  Last login:     {last_login}")
+    print(f"  🔑  Token expires:  {token_exp}")
+    print(f"  📢  Marketing:      {'✅ yes' if mkt is True else '❌ no' if mkt is False else mkt}")
+    print(f"  🏠  IoT integration: {'✅ yes' if iot is True else '❌ no' if iot is False else iot}")
+    if problems:
+        print(f"  ⚠️   Login problems: {problems}")
+
+    # Show token age from local config
+    print(f"  🔐  Local token:    {check_token_age(cfg)}")
+
+    # Show full response for debugging
+    for key, val in data.items():
+        if key not in ("userInformation", "lastLoginTime", "tokenExpirationTime", "loginProblems",
+                        "userInformation", "lastLoginTime", "tokenExpirationTime", "loginProblems"):
+            print(f"  ℹ️   {key}: {val}")
+
+    if edit != "edit":
+        print(f"\n  Edit with: python3 bosch_camera.py profile edit --display-name 'Name' --marketing on|off")
+        return
+
+    # Edit profile — build body from current profile + changes
+    body = {
+        "firstName": user_info.get("firstName", ""),
+        "lastName": user_info.get("lastName", ""),
+        "language": user_info.get("language", "de_DE"),
+        "locale": user_info.get("locale", "de_DE"),
+        "displayName": user_info.get("displayName", ""),
+        "marketingContact": user_info.get("marketingContact", False),
+        "iotThingsIntegration": user_info.get("iotThingsIntegration", True),
+    }
+    changed = False
+    if display_name:
+        body["displayName"] = display_name
+        changed = True
+    if marketing:
+        body["marketingContact"] = marketing.lower() == "on"
+        changed = True
+
+    if not changed:
+        print("\n  ⚠️   No changes specified. Use --display-name and/or --marketing.")
+        return
+
+    print(f"\n  🔄  Updating profile: {body}")
+    pr = session.put(
+        f"{CLOUD_API}/v11/registration",
+        json=body,
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    if pr.status_code in (200, 201, 204):
+        print(f"  ✅  Profile updated.")
+    elif pr.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+        try:
+            print(f"       {pr.json()}")
+        except Exception:
+            print(f"       {pr.text[:200]}")
+    else:
+        print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+def cmd_account(cfg: dict, args) -> None:
+    """Show account info: feature flags, contracts, subscription status.
+
+    Usage:
+      python3 bosch_camera.py account
+
+    API: GET /v11/feature_flags, GET /v11/contracts, GET /v11/purchases
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+
+    print(f"\n── Account Info ───────────────────────────────────────────────")
+
+    # Feature flags
+    print(f"\n  ── Feature Flags ──────────────────────────────────────────────")
+    r = session.get(f"{CLOUD_API}/v11/feature_flags", timeout=10)
+    if r.status_code == 200:
+        flags = r.json()
+        if isinstance(flags, dict):
+            for key, val in flags.items():
+                icon = "✅" if val else "❌"
+                print(f"  {icon}  {key}: {val}")
+        elif isinstance(flags, list):
+            for flag in flags:
+                if isinstance(flag, dict):
+                    fname = flag.get("name", flag.get("key", "?"))
+                    fval  = flag.get("value", flag.get("enabled", "?"))
+                    icon  = "✅" if fval else "❌"
+                    print(f"  {icon}  {fname}: {fval}")
+                else:
+                    print(f"  ✅  {flag}")
+        else:
+            print(f"  {json.dumps(flags, indent=2)}")
+    elif r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+    else:
+        print(f"  ⚠️   Feature flags: HTTP {r.status_code}")
+
+    # Contracts (T&C versions)
+    print(f"\n  ── Contracts / Terms ──────────────────────────────────────────")
+    r = session.get(f"{CLOUD_API}/v11/contracts", params={"locale": "de_DE"}, timeout=10)
+    if r.status_code == 200:
+        contracts = r.json()
+        if isinstance(contracts, dict):
+            tac_ver = contracts.get("tacVersion", "?")
+            tac_url = contracts.get("tacURL", "?")
+            dpn_ver = contracts.get("dpnVersion", "?")
+            dpn_url = contracts.get("dpnURL", "?")
+            print(f"  📄  Terms & Conditions: {tac_ver}")
+            print(f"     {tac_url}")
+            print(f"  🔒  Data Protection:    {dpn_ver}")
+            print(f"     {dpn_url}")
+        elif isinstance(contracts, list):
+            for c in contracts:
+                print(f"  📄  {json.dumps(c)}")
+        else:
+            print(f"  {contracts}")
+    elif r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+    else:
+        print(f"  ⚠️   Contracts: HTTP {r.status_code}")
+
+    # Purchases / subscription
+    print(f"\n  ── Purchases / Subscriptions ──────────────────────────────────")
+    r = session.get(f"{CLOUD_API}/v11/purchases", timeout=10)
+    if r.status_code == 200:
+        purchases = r.json()
+        if isinstance(purchases, list):
+            if not purchases:
+                print(f"  (no active purchases/subscriptions)")
+            for p in purchases:
+                pname   = p.get("name", p.get("productId", "?"))
+                pstatus = p.get("status", p.get("state", "?"))
+                pexpiry = p.get("expiryDate", p.get("validUntil", "?"))
+                icon    = "✅" if pstatus in ("ACTIVE", "active") else "⏸️"
+                print(f"  {icon}  {pname}")
+                print(f"      Status: {pstatus}")
+                if pexpiry and pexpiry != "?":
+                    print(f"      Expires: {pexpiry}")
+        elif isinstance(purchases, dict):
+            print(f"  {json.dumps(purchases, indent=2)}")
+        else:
+            print(f"  {purchases}")
+    elif r.status_code == 444:
+        print(f"  ⚠️   Camera offline or unavailable for this operation")
+    else:
+        print(f"  ⚠️   Purchases: HTTP {r.status_code}")
+
+    print()
+
+
 def cmd_clip_request(cfg: dict, args) -> None:
     """Re-request video clip upload from camera local storage.
 
@@ -4040,6 +4813,11 @@ def main():
         default=None,
         metavar="N",
         help="Number of events to show (default: 10)",
+    )
+    p_ev.add_argument(
+        "--clip",
+        metavar="EVENT_ID",
+        help="Download the MP4 video clip for a specific event ID",
     )
 
     # ── privacy ────────────────────────────────────────────────────────────────
@@ -4534,13 +5312,231 @@ def main():
     p_clip.add_argument("--last", type=int, default=10,
                         help="Check last N events for unavailable clips (default: 10)")
 
+    # ── privacy-sound ─────────────────────────────────────────────────────
+    p_psound = subparsers.add_parser(
+        "privacy-sound",
+        help="Show or toggle privacy sound (audible indicator when privacy mode changes)",
+        description=(
+            "🔊  privacy-sound — Show or toggle privacy sound override\n"
+            "\n"
+            "  When enabled, the camera plays an audible indicator whenever\n"
+            "  privacy mode is toggled on or off.\n"
+            "  API: GET/PUT /v11/video_inputs/{id}/privacy_sound_override\n"
+            "       Body: {\"result\": true/false}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py privacy-sound\n"
+            "    python3 bosch_camera.py privacy-sound Garten\n"
+            "    python3 bosch_camera.py privacy-sound on\n"
+            "    python3 bosch_camera.py privacy-sound Garten on\n"
+            "    python3 bosch_camera.py privacy-sound Garten off"
+        ),
+    )
+    p_psound.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_psound.add_argument(
+        "action",
+        nargs="?",
+        metavar="on|off",
+        choices=["on", "off"],
+        help="Enable or disable privacy sound",
+    )
+
+    # ── rules ─────────────────────────────────────────────────────────────
+    p_rules = subparsers.add_parser(
+        "rules",
+        help="Manage camera automation rules (time-based schedules)",
+        description=(
+            "📋  rules — Manage camera automation rules\n"
+            "\n"
+            "  Time-based schedules stored on the camera.\n"
+            "  API: GET/POST/PUT/DELETE /v11/video_inputs/{id}/rules\n"
+            "\n"
+            "  Subcommands:\n"
+            "    (none)  → list all rules for a camera\n"
+            "    add     → create a new rule with name, time, days\n"
+            "    edit    → update an existing rule (activate/deactivate)\n"
+            "    delete  → remove a rule by ID"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py rules Garten\n"
+            "    python3 bosch_camera.py rules Garten add --name 'Night Mode' --start 22:00 --end 06:00 --days 0,1,2,3,4,5,6\n"
+            "    python3 bosch_camera.py rules Garten edit --id UUID --active\n"
+            "    python3 bosch_camera.py rules Garten edit --id UUID --inactive\n"
+            "    python3 bosch_camera.py rules Garten delete --id UUID"
+        ),
+    )
+    p_rules.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_rules.add_argument(
+        "sub",
+        nargs="?",
+        metavar="add|edit|delete",
+        help="Subcommand: add, edit, or delete a rule",
+    )
+    p_rules.add_argument("--name", dest="rule_name", metavar="NAME",
+                         help="Rule name (for add)")
+    p_rules.add_argument("--start", default="00:00", metavar="HH:MM",
+                         help="Start time (for add, default 00:00)")
+    p_rules.add_argument("--end", default="23:59", metavar="HH:MM",
+                         help="End time (for add, default 23:59)")
+    p_rules.add_argument("--days", default="0,1,2,3,4,5,6", metavar="0,1,2,...",
+                         help="Weekdays 0=Mon..6=Sun comma-separated (for add, default all)")
+    p_rules.add_argument("--id", dest="rule_id", metavar="RULE_ID",
+                         help="Rule ID (for edit/delete)")
+    p_rules.add_argument("--active", action="store_true",
+                         help="Activate the rule (for edit)")
+    p_rules.add_argument("--inactive", action="store_true",
+                         help="Deactivate the rule (for edit)")
+
+    # ── friends ───────────────────────────────────────────────────────────
+    p_friends = subparsers.add_parser(
+        "friends",
+        help="Manage camera sharing with friends",
+        description=(
+            "👥  friends — Manage camera sharing with friends\n"
+            "\n"
+            "  Invite friends, share cameras, manage invitations.\n"
+            "  API: GET/POST/PUT/DELETE /v11/friends/*\n"
+            "\n"
+            "  Subcommands:\n"
+            "    (none)  → list all friends\n"
+            "    invite  → send invitation to an email address\n"
+            "    share   → share a camera with a friend\n"
+            "    unshare → remove all camera shares from a friend\n"
+            "    resend  → re-send the invitation email\n"
+            "    remove  → remove a friend entirely"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py friends\n"
+            "    python3 bosch_camera.py friends invite user@example.com\n"
+            "    python3 bosch_camera.py friends share FRIEND_ID Garten\n"
+            "    python3 bosch_camera.py friends share FRIEND_ID Garten --days 7\n"
+            "    python3 bosch_camera.py friends unshare FRIEND_ID\n"
+            "    python3 bosch_camera.py friends resend FRIEND_ID\n"
+            "    python3 bosch_camera.py friends remove FRIEND_ID"
+        ),
+    )
+    p_friends.add_argument(
+        "sub",
+        nargs="?",
+        metavar="invite|share|unshare|resend|remove",
+        help="Subcommand",
+    )
+    p_friends.add_argument(
+        "sub_arg",
+        nargs="?",
+        metavar="EMAIL|FRIEND_ID",
+        help="Email (for invite) or Friend ID (for other subcommands)",
+    )
+    p_friends.add_argument(
+        "share_cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name (for share subcommand)",
+    )
+    p_friends.add_argument("--days", type=int, metavar="N",
+                           help="Share duration in days (for share; omit = permanent)")
+
+    # ── rename ────────────────────────────────────────────────────────────
+    p_rename = subparsers.add_parser(
+        "rename",
+        help="Rename a camera",
+        description=(
+            "✏️   rename — Rename a camera via the Bosch cloud API\n"
+            "\n"
+            "  Changes the camera title stored in the Bosch cloud.\n"
+            "  Also updates the local bosch_config.json.\n"
+            "  API: PUT /v11/video_inputs"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py rename Garten \"Garden Camera\"\n"
+            "    python3 bosch_camera.py rename Kamera \"Indoor Cam\""
+        ),
+    )
+    p_rename.add_argument(
+        "cam",
+        metavar="<camera>",
+        help="Current camera name or partial match",
+    )
+    p_rename.add_argument(
+        "new_name",
+        metavar="\"New Name\"",
+        help="New camera name (use quotes if it contains spaces)",
+    )
+
+    # ── profile ───────────────────────────────────────────────────────────
+    p_profile = subparsers.add_parser(
+        "profile",
+        help="Show or edit user profile (name, email, marketing consent)",
+        description=(
+            "👤  profile — Show or edit user profile\n"
+            "\n"
+            "  Displays account info from the Bosch cloud:\n"
+            "  name, email, last login, marketing consent, IoT integration.\n"
+            "\n"
+            "  API: GET /v11/registration/check, PUT /v11/registration"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py profile\n"
+            "    python3 bosch_camera.py profile edit --display-name 'John'\n"
+            "    python3 bosch_camera.py profile edit --marketing off\n"
+            "    python3 bosch_camera.py profile edit --display-name 'John' --marketing on"
+        ),
+    )
+    p_profile.add_argument(
+        "sub",
+        nargs="?",
+        metavar="edit",
+        help="Subcommand: 'edit' to update profile",
+    )
+    p_profile.add_argument("--display-name", dest="display_name", metavar="NAME",
+                           help="New display name")
+    p_profile.add_argument("--marketing", metavar="on|off",
+                           help="Marketing consent: on or off")
+
+    # ── account ───────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "account",
+        help="Show account info: feature flags, contracts, subscriptions",
+        description=(
+            "📊  account — Show account information\n"
+            "\n"
+            "  Displays feature flags, terms & conditions versions,\n"
+            "  and active purchases/subscriptions.\n"
+            "\n"
+            "  API: GET /v11/feature_flags, GET /v11/contracts, GET /v11/purchases"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="  Example:\n    python3 bosch_camera.py account",
+    )
+
     # ── parse ──────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
     # Provide sensible defaults for attributes that some subparsers don't define,
     # so all cmd_* functions can safely use getattr(args, "...", default).
     _defaults = dict(
-        cam=None, action=None, sub=None, limit=None,
+        cam=None, action=None, sub=None, sub_arg=None, share_cam=None,
+        limit=None, clip=None,
         snaps_only=False, clips_only=False, re_download=False,
         live=False, vlc=False, full=False, minutes=None,
         interval=30, duration=0,
@@ -4548,6 +5544,9 @@ def main():
         threshold=None, sound_on=False, sound_off=False, push=False,
         signal=None, signal_sender=None, signal_recipients=None,
         push_mode="auto", speaker_level=50,
+        rule_name=None, start="00:00", end="23:59", days="0,1,2,3,4,5,6",
+        rule_id=None, active=False, inactive=False,
+        new_name=None, display_name=None, marketing=None,
     )
     for _k, _v in _defaults.items():
         if not hasattr(args, _k):
@@ -4597,6 +5596,12 @@ def main():
         "siren":         cmd_siren,
         "unread":        cmd_unread,
         "clip-request":  cmd_clip_request,
+        "privacy-sound": cmd_privacy_sound,
+        "rules":         cmd_rules,
+        "friends":       cmd_friends,
+        "rename":        cmd_rename,
+        "profile":       cmd_profile,
+        "account":       cmd_account,
         "intercom":      cmd_intercom,
         "rcp":           cmd_rcp,
         "token":         cmd_token,

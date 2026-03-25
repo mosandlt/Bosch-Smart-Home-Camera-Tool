@@ -1,8 +1,10 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v4.2.0**
+> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
+> No official API. No app needed after setup. **v5.0.0**
+
+<a href="https://buymeacoffee.com/mosandlts"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=mosandlts&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" /></a>
 
 ---
 
@@ -47,7 +49,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-- [What's New in v4.0.0](#whats-new-in-v400)
+- [What's New in v5.0.0](#whats-new-in-v500)
 - [How It Works](#how-it-works)
 - [Cloud API Reference](#cloud-api-reference)
 - [RCP Protocol — Low-Level Camera Reads](#rcp-protocol--low-level-camera-reads)
@@ -97,6 +99,13 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Unread events count** | `unread [cam]` |
 | **Push mode selection (auto/iOS/Android/polling)** | `watch --push --push-mode auto\|ios\|android\|polling` |
 | **Re-request video clip from camera** | `clip-request [cam] [--event-id ID] [--last N]` |
+| **Direct clip download by event ID** | `events [cam] --clip EVENT_ID` |
+| **Privacy sound — audible privacy indicator** | `privacy-sound [cam] [on\|off]` |
+| **Cloud automation rules** | `rules [cam] [list\|add\|edit\|delete]` |
+| **Camera sharing with friends** | `friends [list\|invite\|share\|unshare\|resend\|remove]` |
+| **Rename a camera** | `rename [cam] "New Name"` |
+| **User profile management** | `profile [--name\|--language]` |
+| **Account info & feature flags** | `account` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
 
@@ -202,6 +211,7 @@ python3 bosch_camera.py download Outdoor --clips-only
 
 ```bash
 python3 bosch_camera.py events Outdoor --limit 20
+python3 bosch_camera.py events Outdoor --clip abc123   # download clip for a specific event ID
 ```
 
 ### Privacy Mode
@@ -309,6 +319,56 @@ python3 bosch_camera.py clip-request --event-id abc123    # re-request a specifi
 
 Error `-353` means the clip cannot be requested (recording overwritten on camera or event too old).
 
+### Privacy Sound (CAMERA_360 Only)
+
+```bash
+python3 bosch_camera.py privacy-sound Indoor          # show current privacy sound state
+python3 bosch_camera.py privacy-sound Indoor on       # enable audible indicator on privacy change
+python3 bosch_camera.py privacy-sound Indoor off      # disable audible indicator
+```
+
+Returns HTTP 442 on outdoor cameras (not supported).
+
+### Rules — Cloud Automation
+
+```bash
+python3 bosch_camera.py rules Outdoor                 # list all automation rules
+python3 bosch_camera.py rules Outdoor add             # add a new time-based rule
+python3 bosch_camera.py rules Outdoor edit RULE_ID    # edit an existing rule
+python3 bosch_camera.py rules Outdoor delete RULE_ID  # delete a rule
+```
+
+### Friends — Camera Sharing
+
+```bash
+python3 bosch_camera.py friends                       # list all shared contacts
+python3 bosch_camera.py friends invite user@example.com  # invite a new friend
+python3 bosch_camera.py friends share Outdoor FRIEND_ID  # share a camera with a friend
+python3 bosch_camera.py friends unshare Outdoor FRIEND_ID # stop sharing a camera
+python3 bosch_camera.py friends resend FRIEND_ID      # resend invitation email
+python3 bosch_camera.py friends remove FRIEND_ID      # remove a friend
+```
+
+### Rename
+
+```bash
+python3 bosch_camera.py rename Outdoor "Garden Camera"  # rename a camera via cloud API
+```
+
+### Profile
+
+```bash
+python3 bosch_camera.py profile                       # show user profile (name, email, language)
+python3 bosch_camera.py profile --name "New Name"     # update display name
+python3 bosch_camera.py profile --language en          # change language preference
+```
+
+### Account
+
+```bash
+python3 bosch_camera.py account                       # show feature flags, T&C versions, subscription status
+```
+
 ### RCP Protocol Reads
 
 ```bash
@@ -358,50 +418,45 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 
 ---
 
-## What's New in v4.0.0
+## What's New in v5.0.0
 
-**New `intercom` command**
-Listen to camera audio in real-time via the cloud proxy. Opens an RTSPS audio stream through ffplay with configurable duration and speaker volume. Two-way talk (microphone to camera) is not yet supported via the cloud API — listen-only via RTSPS.
+**New `privacy-sound` command**
+Show or toggle the audible privacy indicator on CAMERA_360 indoor cameras. When enabled, the camera plays a sound when privacy mode changes. Returns HTTP 442 on outdoor cameras (not supported).
 
-```bash
-python3 bosch_camera.py intercom Indoor                    # listen for 60s
-python3 bosch_camera.py intercom Outdoor --duration 120    # listen for 2 minutes
-python3 bosch_camera.py intercom Indoor --speaker-level 80 # set speaker volume 0-100
-```
+**New `rules` command**
+Manage cloud-side camera automation rules (time-based schedules). Subcommands: `list`, `add`, `edit`, `delete`. Rules are stored in the Bosch cloud, not on the camera firmware.
 
-The intercom command:
-1. Sets the camera speaker level via `PUT /v11/video_inputs/{id}/audio`
-2. Opens a live proxy connection (`PUT /connection`)
-3. Plays the RTSPS audio stream through ffplay (no video window)
+**New `friends` command**
+Manage camera sharing with friends. Subcommands: `list`, `invite`, `share`, `unshare`, `resend`, `remove`. Uses the invitation-based sharing system discovered in the iOS app.
 
-**New `siren` command**
-Trigger the acoustic alarm (siren) on a CAMERA_360 indoor camera via `PUT /v11/video_inputs/{id}/acoustic_alarm`. Returns HTTP 442 on outdoor cameras (not supported).
+**New `rename` command**
+Rename a camera via the cloud API. The new name is reflected in the Bosch app and all API responses.
 
-**New `unread` command**
-Show the unread event count per camera via `GET /v11/video_inputs/{id}/unread_events_count`.
+**New `profile` command**
+Show or edit user profile information: display name, email, language preference, marketing consent.
 
-**Person detection icon in output**
-Events with type `PERSON_DETECTED` now show a person icon in `watch` and `events` output, distinguishing them from generic `MOVEMENT` events.
+**New `account` command**
+Show account info including feature flags, Terms & Conditions versions, and subscription status.
 
-**Mark-as-read**
-Events are automatically marked as read after download (`download` command) or push alert processing (`watch --push`). Uses `PUT /v11/events/bulk` for batch updates and `PUT /v11/events/{id}` for individual events. The `GET /v11/video_inputs/{id}/last_event` endpoint is used as a fast-path to check for new events before fetching the full event list.
+**Direct clip download via `events --clip`**
+Download a specific video clip by event ID: `events Outdoor --clip EVENT_ID`. Fetches the clip directly without needing the `download` command.
 
-**New `--push-mode` flag for `watch --push`**
-Select the FCM push notification mode explicitly instead of relying on auto-detection:
-
-| `--push-mode` | Behavior |
-|---------------|----------|
-| `auto` (default) | Tries iOS first, then Android, then falls back to polling |
-| `ios` | Uses iOS FCM App ID and API key only |
-| `android` | Uses Android FCM App ID and API key only |
-| `polling` | Disables FCM push entirely, uses periodic polling only |
-
-All FCM modes register with the same Firebase project (`bosch-smart-cameras`, Sender ID `404630424405`). The API keys are base64-encoded in the source code. The `polling` mode disables FCM entirely and uses periodic API polling only.
+**HTTP 444 handling**
+Proper handling of HTTP 444 responses (connection closed without response). Previously these caused unhandled exceptions; now they are caught and reported as transient errors with retry guidance.
 
 ---
 
 <details>
 <summary><strong>Previous Version History</strong></summary>
+
+### What's New in v4.0.0
+
+- **`intercom` command**: listen to camera audio in real-time via cloud proxy RTSPS stream (listen-only, configurable duration + speaker volume)
+- **`siren` command**: trigger acoustic alarm on CAMERA_360 indoor camera (442 on outdoor)
+- **`unread` command**: show unread event count per camera
+- **Person detection icon**: `PERSON_DETECTED` events show a person icon in `watch` and `events` output
+- **Mark-as-read**: events auto-marked as read after download or push alert processing
+- **`--push-mode` flag**: select FCM push mode explicitly (`auto`/`ios`/`android`/`polling`)
 
 ### What's New in v3.0.0
 
@@ -1500,7 +1555,8 @@ tool/
 
 | Version | Changes |
 |---------|---------|
-| **v4.0.0** | Intercom (listen-only), siren command, unread events, person detection icon, mark-as-read, `--push-mode` flag |
+| **v5.0.0** | New commands: privacy-sound, rules, friends, rename, profile, account. HTTP 444 handling. Direct clip download via `events --clip`. |
+| v4.0.0 | Intercom (listen-only), siren command, unread events, person detection icon, mark-as-read, `--push-mode` flag |
 | v3.0.0 | FCM push notifications, Signal alerts, auto-follow, fixed motion sensitivity enum |
 | v2.0.0 | Code cleanup |
 | v1.9.0 | Push notification architecture documented |
