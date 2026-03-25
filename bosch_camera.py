@@ -1425,6 +1425,33 @@ def cmd_info(cfg: dict, args) -> None:
             except Exception:
                 pass
 
+            # /credentials (local camera userToken)
+            try:
+                cr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/credentials", timeout=10)
+                if cr.status_code == 200:
+                    crd = cr.json()
+                    print(f"      Credentials:   userToken={crd.get('userToken', '?')}")
+            except Exception:
+                pass
+
+            # /rules (camera automation rules)
+            try:
+                rr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/rules", timeout=10)
+                if rr.status_code == 200:
+                    rules = rr.json()
+                    print(f"      Rules:         {len(rules)} rule(s) — {json.dumps(rules)[:200]}")
+            except Exception:
+                pass
+
+            # /timestamp (time/date overlay)
+            try:
+                tr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/timestamp", timeout=10)
+                if tr.status_code == 200:
+                    td = tr.json()
+                    print(f"      Timestamp:     overlay={td.get('result', '?')}")
+            except Exception:
+                pass
+
             # ── RCP (via proxy) ───────────────────────────────────────────
             print(f"\n      ── RCP (via proxy) ──────────────────────────────────────")
             try:

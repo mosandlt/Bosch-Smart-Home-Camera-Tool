@@ -1,0 +1,5 @@
+bosch_config.json
+captures/
+__pycache__/
+*.pyc
+.DS_Store

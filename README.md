@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v4.0.0**
+> No official API. No app needed after setup. **v4.2.0**
 
 ---
 
@@ -1200,6 +1200,54 @@ the Bosch Smart Home Camera app using mitmproxy:
 > Note: The Bosch Smart Camera app has **no SSL certificate pinning**
 > (`NSAllowsArbitraryLoads: true` on iOS). mitmproxy intercepts at the OS level
 > after installing the CA cert.
+
+### Capturing App Traffic with mitmproxy
+
+The included `start_proxy.py` script sets up mitmproxy with everything pre-configured
+for Bosch Smart Camera app traffic analysis. This is useful for:
+
+- **Investigating motion detection rules** — the camera reverts motion settings within ~1s; capturing app traffic may reveal which endpoint the official app uses
+- **Discovering new API endpoints** — see exactly what the app sends
+- **Capturing local camera credentials** — Digest auth headers when the app connects directly to cameras on LAN
+
+#### Quick Start
+
+```bash
+pip3 install mitmproxy          # one-time install
+python3 start_proxy.py          # starts proxy, auto-detects your Mac IP
+python3 start_proxy.py --dump   # same, but saves all flows to captures/ folder
+```
+
+#### Phone Configuration
+
+1. **WiFi proxy**: Settings → WiFi → your network → Configure Proxy → Manual
+   - Server: your Mac's IP (shown by the script), Port: `8890`
+2. **Install CA cert**: open `http://mitm.it` in phone browser → download + install
+3. **iOS only**: Settings → General → About → Certificate Trust Settings → enable mitmproxy
+4. **Force-close** and reopen the Bosch Smart Camera app
+5. All traffic appears in the terminal
+
+#### What to Look For
+
+| Goal | Watch for |
+|------|-----------|
+| Motion detection rules | `PUT /v11/video_inputs/{id}/rules/{ruleId}` |
+| Motion settings | `PUT /v11/video_inputs/{id}/motion` |
+| Local camera credentials | `Authorization: Digest ...` to `192.168.x.x` |
+| Bearer tokens | `Authorization: Bearer eyJ...` |
+| New endpoints | Any `PUT`/`POST` to `residential.cbs.boschsecurity.com` |
+
+#### Saved Flows
+
+When using `--dump`, flows are saved to `captures/bosch_flows_YYYY-MM-DD_HHMMSS.mitm`.
+View them later:
+
+```bash
+mitmproxy --rfile captures/bosch_flows_2026-03-25_143000.mitm
+```
+
+> **Important**: Captured flows contain your Bearer token and personal data.
+> Never share `.mitm` files publicly. The `captures/` folder is in `.gitignore`.
 
 ---
 
