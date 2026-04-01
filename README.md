@@ -1,8 +1,8 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
-> Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v5.2.0**
+> Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
+> No official API. No app needed after setup. **v7.0.0**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -99,8 +99,8 @@ of Bosch's software was distributed. Only network protocol observations were use
 | Live stream — high quality | `live --hq` or `live --quality high` |
 | Live stream — low bandwidth | `live --quality low` |
 | Live stream — select instance | `live --inst N` |
-| Download all event snapshots (JPEG) | `download` |
-| Recent event list | `events` |
+| **Live stream LOCAL (LAN, TLS proxy)** | `live --local [cam]` |
+| **Live stream LOCAL + best quality** | `live --local --quality high [cam]` |
 | **Privacy mode — get/set via cloud API** | `privacy [cam] [on\|off]` |
 | **Camera light — on/off via cloud API** | `light [cam] [on\|off]` |
 | **Push notifications — on/off** | `notifications [cam] [on\|off]` |
@@ -421,10 +421,23 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 
 ---
 
-## What's New in v5.2.0
+## What's New in v7.0.0
+
+**LOCAL LAN streaming with TLS proxy**
+New `live --local` command streams directly from the camera over your local network — no cloud proxy needed. A built-in TLS proxy handles the camera's self-signed certificate and Digest authentication, which FFmpeg cannot process natively. Audio + video in HD quality (30 Mbps) by default on LAN.
+
+**Menu: Local stream entries + exit with "q"**
+The interactive menu now includes "Live stream LOCAL" entries for each camera. Exit changed from "0" to "q".
+
+**Code cleanup**
+Removed download and events commands (cloud event access removed). 123 lines of dead code cleaned up.
+
+<details>
+<summary><strong>v5.2.0</strong></summary>
 
 **Live stream session — up to 60 minutes**
-The live stream (`live` command) now uses `maxSessionDuration=3600`, giving you a full 60-minute session before a reconnect is needed. Previously the session could be limited to 60 seconds. After 60 minutes, simply re-run the `live` command to start a new session.
+The live stream (`live` command) now uses `maxSessionDuration=3600`, giving you a full 60-minute session before a reconnect is needed.
+</details>
 
 ---
 
