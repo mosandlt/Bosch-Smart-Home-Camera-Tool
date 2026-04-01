@@ -438,19 +438,6 @@ def api_get_camera(session: requests.Session, cam_id: str) -> dict | None:
     return None
 
 
-def build_filename(event: dict, ext: str) -> str:
-    ts    = event.get("timestamp", "")[:19].replace(":", "-").replace("T", "_")
-    etype = event.get("eventType", "EVENT")
-    ev_id = event.get("id", "")[:8]
-    return f"{ts}_{etype}_{ev_id}.{ext}"
-
-
-def get_download_folder(cfg: dict, cam_info: dict) -> str:
-    """Resolve the absolute download folder for a camera."""
-    base = cfg["settings"].get("download_base_path", "") or BASE_DIR
-    return os.path.join(base, cam_info.get("download_folder", cam_info["name"]))
-
-
 # ══════════════════════════ OPEN FILE / VLC ═══════════════════════════════════
 
 def open_file(path: str) -> None:
@@ -538,27 +525,10 @@ def cmd_status(cfg: dict, args) -> None:
 
 
 def cmd_events(cfg: dict, args) -> None:
-    """Show latest events for a camera."""
-    token   = get_token(cfg)
-    session = make_session(token)
-    cameras = get_cameras(cfg, session)
-    limit   = getattr(args, "limit", None) or 10
-    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+    """Show latest events — removed (cloud event listing no longer available)."""
+    print("  ⚠️  Events command has been removed.")
+    return
 
-    for name, cam_info in cams.items():
-        print(f"\n── Events: {name} (last {limit}) ────────────────────────────")
-        events = api_get_events(session, cam_info["id"], limit=limit)
-        if not events:
-            print("  (no events or token expired)")
-            continue
-        for ev in events[:limit]:
-            ts    = ev.get("timestamp", "")[:19]
-            etype = ev.get("eventType", "")
-            ev_id = ev.get("id", "")
-            has_img  = "📸" if ev.get("imageUrl")     else "  "
-            has_clip = "🎬" if ev.get("videoClipUrl") else "  "
-            clip_st  = ev.get("videoClipUploadStatus", "")
-            print(f"  {has_img}{has_clip}  {ts}  {etype:20s}  {clip_st}  id={ev_id[:8]}")
 
 
 # ══════════════════════════ LIVE SNAPSHOT METHODS ═══════════════════════════
@@ -778,96 +748,6 @@ def cmd_snapshot(cfg: dict, args) -> None:
                 print(f"       not a live view. Use '--live' for live snapshot methods.")
         else:
             print("  ⚠️   No snapshot available (token expired or no events).")
-
-
-def cmd_download(cfg: dict, args) -> None:
-    """Bulk-download all event snapshots for a camera."""
-    token    = get_token(cfg)
-    session  = make_session(token)
-    session.headers["Accept"] = "*/*"
-    cameras  = get_cameras(cfg, session)
-    cams     = resolve_cam(cfg, getattr(args, "cam", None))
-
-    limit       = getattr(args, "limit",      None)
-    re_download = getattr(args, "re_download", False)
-
-    start = datetime.datetime.now()
-
-    for name, cam_info in cams.items():
-        folder = get_download_folder(cfg, cam_info)
-        os.makedirs(folder, exist_ok=True)
-
-        print(f"\n{'='*60}")
-        print(f"📷  {name}  ({cam_info['id']})")
-        print(f"📂  {folder}")
-        print(f"{'='*60}")
-
-        url = f"{CLOUD_API}/v11/events?videoInputId={cam_info['id']}"
-        if limit:
-            url += f"&limit={limit}"
-
-        r = session.get(url, timeout=30)
-        if r.status_code == 401:
-            print("  ❌  Token expired — recapture needed.")
-            cfg["account"]["bearer_token"] = ""
-            save_config(cfg)
-            sys.exit(1)
-        r.raise_for_status()
-        events = r.json()
-        print(f"  Found {len(events)} events\n")
-
-        snaps_dl = snaps_skip = snaps_miss = 0
-
-        for i, ev in enumerate(events):
-            img_url  = ev.get("imageUrl")
-            ts       = ev.get("timestamp", "")[:19]
-            etype    = ev.get("eventType", "")
-            print(f"  [{i+1}/{len(events)}]  {ts}  {etype}")
-
-            # ── Snapshot ──────────────────────────────────────────────────────
-            if img_url:
-                fn   = build_filename(ev, "jpg")
-                dest = os.path.join(folder, fn)
-                if os.path.exists(dest) and not re_download:
-                    print(f"    ⏭️   Skip: {fn}")
-                    snaps_skip += 1
-                else:
-                    time.sleep(DELAY)
-                    rr = session.get(img_url, timeout=60, stream=True)
-                    if rr.status_code == 200:
-                        with open(dest, "wb") as f:
-                            for chunk in rr.iter_content(65536):
-                                f.write(chunk)
-                        print(f"    💾  {fn}  ({os.path.getsize(dest):,} bytes)")
-                        snaps_dl += 1
-                    else:
-                        print(f"    ❌  snap HTTP {rr.status_code}")
-            else:
-                snaps_miss += 1
-
-        # Mark all downloaded events as read on the Bosch cloud
-        read_ids = [ev.get("id") for ev in events if ev.get("id")]
-        if read_ids:
-            try:
-                if api_mark_events_read(session, read_ids):
-                    print(f"\n  ✅  Marked {len(read_ids)} events as read")
-                else:
-                    print(f"\n  ⚠️   Could not mark events as read (API may not support it)")
-            except Exception:
-                pass
-
-        print(f"\n  ✅  Summary — {name}:")
-        print(f"      Snapshots: {snaps_dl} downloaded, {snaps_skip} skipped, {snaps_miss} no image")
-
-    elapsed = datetime.datetime.now() - start
-    print(f"\n🏁  Done in {elapsed.seconds}s")
-    for name, cam_info in cams.items():
-        folder = get_download_folder(cfg, cam_info)
-        if os.path.exists(folder):
-            files = [f for f in os.listdir(folder) if not f.startswith(".")]
-            total = sum(os.path.getsize(os.path.join(folder, f)) for f in files)
-            szm   = f"{total/1_000_000:.1f} MB" if total > 1_000_000 else f"{total:,} bytes"
-            print(f"   📂  {folder}  →  {len(files)} files, {szm}")
 
 
 def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None:
