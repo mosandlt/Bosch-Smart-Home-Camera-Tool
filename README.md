@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
 > Live snapshots, event downloads, live video stream, privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v5.1.0**
+> No official API. No app needed after setup. **v5.2.0**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -68,7 +68,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-- [What's New in v5.1.0](#whats-new-in-v510)
+- [What's New in v5.2.0](#whats-new-in-v520)
 - [How It Works](#how-it-works)
 - [Cloud API Reference](#cloud-api-reference)
 - [RCP Protocol — Low-Level Camera Reads](#rcp-protocol--low-level-camera-reads)
@@ -99,7 +99,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 | Live stream — high quality | `live --hq` or `live --quality high` |
 | Live stream — low bandwidth | `live --quality low` |
 | Live stream — select instance | `live --inst N` |
-| Download all events (JPEG + MP4) | `download` |
+| Download all event snapshots (JPEG) | `download` |
 | Recent event list | `events` |
 | **Privacy mode — get/set via cloud API** | `privacy [cam] [on\|off]` |
 | **Camera light — on/off via cloud API** | `light [cam] [on\|off]` |
@@ -117,8 +117,6 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Siren — trigger acoustic alarm (360 only)** | `siren [cam]` |
 | **Unread events count** | `unread [cam]` |
 | **Push mode selection (auto/iOS/Android/polling)** | `watch --push --push-mode auto\|ios\|android\|polling` |
-| **Re-request video clip from camera** | `clip-request [cam] [--event-id ID] [--last N]` |
-| **Direct clip download by event ID** | `events [cam] --clip EVENT_ID` |
 | **Privacy sound — audible privacy indicator** | `privacy-sound [cam] [on\|off]` |
 | **Cloud automation rules** | `rules [cam] [list\|add\|edit\|delete]` |
 | **Camera sharing with friends** | `friends [list\|invite\|share\|unshare\|resend\|remove]` |
@@ -224,15 +222,12 @@ python3 bosch_camera.py live Outdoor --quality auto    # default balanced (inst=
 python3 bosch_camera.py download                  # all cameras
 python3 bosch_camera.py download Outdoor
 python3 bosch_camera.py download Outdoor --limit 50
-python3 bosch_camera.py download Outdoor --snaps-only
-python3 bosch_camera.py download Outdoor --clips-only
 ```
 
 ### Events
 
 ```bash
 python3 bosch_camera.py events Outdoor --limit 20
-python3 bosch_camera.py events Outdoor --clip abc123   # download clip for a specific event ID
 ```
 
 ### Privacy Mode
@@ -326,19 +321,6 @@ python3 bosch_camera.py siren Indoor             # trigger acoustic alarm
 python3 bosch_camera.py unread                   # show unread count for all cameras
 python3 bosch_camera.py unread Outdoor            # show unread count for one camera
 ```
-
-### Clip Re-Request
-
-Re-request video clips that weren't uploaded by Bosch (status `Unavailable`).
-The camera will re-upload from its local SD storage if the recording still exists.
-
-```bash
-python3 bosch_camera.py clip-request Outdoor              # scan last 10 events for unavailable clips
-python3 bosch_camera.py clip-request Outdoor --last 50    # scan last 50 events
-python3 bosch_camera.py clip-request --event-id abc123    # re-request a specific event clip
-```
-
-Error `-353` means the clip cannot be requested (recording overwritten on camera or event too old).
 
 ### Privacy Sound (CAMERA_360 Only)
 
@@ -439,7 +421,17 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 
 ---
 
-## What's New in v5.0.0
+## What's New in v5.2.0
+
+**Live stream session — up to 60 minutes**
+The live stream (`live` command) now uses `maxSessionDuration=3600`, giving you a full 60-minute session before a reconnect is needed. Previously the session could be limited to 60 seconds. After 60 minutes, simply re-run the `live` command to start a new session.
+
+---
+
+<details>
+<summary><strong>Previous Version History</strong></summary>
+
+### What's New in v5.0.0
 
 **New `privacy-sound` command**
 Show or toggle the audible privacy indicator on CAMERA_360 indoor cameras. When enabled, the camera plays a sound when privacy mode changes. Returns HTTP 442 on outdoor cameras (not supported).
@@ -459,16 +451,10 @@ Show or edit user profile information: display name, email, language preference,
 **New `account` command**
 Show account info including feature flags, Terms & Conditions versions, and subscription status.
 
-**Direct clip download via `events --clip`**
-Download a specific video clip by event ID: `events Outdoor --clip EVENT_ID`. Fetches the clip directly without needing the `download` command.
-
 **HTTP 444 handling**
 Proper handling of HTTP 444 responses (connection closed without response). Previously these caused unhandled exceptions; now they are caught and reported as transient errors with retry guidance.
 
 ---
-
-<details>
-<summary><strong>Previous Version History</strong></summary>
 
 ### What's New in v4.0.0
 
@@ -731,7 +717,6 @@ GET /v11/events?videoInputId={id}&limit=400
 
 The tool iterates all events and downloads:
 - `snap.jpg` for each event with `imageUrl`
-- `clip.mp4` for each event with `videoClipUploadStatus == "Done"`
 
 Already-downloaded files are skipped (by filename). Rate-limited to
 0.5 s between requests to avoid API throttling.
@@ -834,13 +819,10 @@ All lighting endpoints return HTTP 442 on the 360 indoor camera.
 | `GET` | `/v11/events?videoInputId={id}&limit=N` | Event list for a camera (JPEG + clip URLs, timestamps, types) |
 | `GET` | `/v11/events/{eventId}` | Single event details |
 | `PUT` | `/v11/events/bulk` | Batch update events (mark as read, toggle favorite) |
-| `POST` | `/v11/events/{eventId}/clip_request` | **Re-request video clip** — tells camera to re-upload clip from local storage |
+| `POST` | `/v11/events/{eventId}/clip_request` | Re-request video clip — tells camera to re-upload clip from local storage |
 | `GET` | `/v11/events/{eventId}/snap` | Event snapshot JPEG (direct download) |
 | `GET` | `/v11/video_inputs/{id}/last_event` | Latest event for a camera (fast-path) |
 | `GET` | `/v11/video_inputs/{id}/unread_events_count` | Unread event count |
-
-**Video clip re-request (`POST /v11/events/{eventId}/clip_request`):**
-When an event has `videoClipUploadStatus: "Unavailable"` (Bosch didn't generate the clip) or the clip failed to upload, this endpoint tells the camera to re-upload the video from its local SD storage. The clip status changes to `Pending` during upload. Error `-353` means the clip cannot be requested (recording already overwritten on camera). This is particularly useful for outdoor cameras where the free tier often returns `Unavailable` for daytime events.
 
 ### Firmware & WiFi
 
@@ -1576,7 +1558,8 @@ tool/
 
 | Version | Changes |
 |---------|---------|
-| **v5.0.0** | New commands: privacy-sound, rules, friends, rename, profile, account. HTTP 444 handling. Direct clip download via `events --clip`. |
+| **v5.2.0** | Fix live stream session duration (`maxSessionDuration=3600` — stream runs up to 60 min). |
+| **v5.1.0** | New commands: privacy-sound, rules, friends, rename, profile, account. HTTP 444 handling. |
 | v4.0.0 | Intercom (listen-only), siren command, unread events, person detection icon, mark-as-read, `--push-mode` flag |
 | v3.0.0 | FCM push notifications, Signal alerts, auto-follow, fixed motion sensitivity enum |
 | v2.0.0 | Code cleanup |

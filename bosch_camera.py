@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "5.1.0"
+VERSION     = "5.2.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -538,41 +538,12 @@ def cmd_status(cfg: dict, args) -> None:
 
 
 def cmd_events(cfg: dict, args) -> None:
-    """Show latest events for a camera.
-
-    With --clip EVENT_ID: download the MP4 video clip for a specific event.
-    """
+    """Show latest events for a camera."""
     token   = get_token(cfg)
     session = make_session(token)
     cameras = get_cameras(cfg, session)
     limit   = getattr(args, "limit", None) or 10
     cams    = resolve_cam(cfg, getattr(args, "cam", None))
-    clip_id = getattr(args, "clip", None)
-
-    # ── Download a specific clip ──────────────────────────────────────────
-    if clip_id:
-        session.headers["Accept"] = "*/*"
-        print(f"\n── Downloading clip for event {clip_id} ──────────────────────")
-        r = session.get(f"{CLOUD_API}/v11/events/{clip_id}/clip.mp4", timeout=120, stream=True)
-        if r.status_code == 200:
-            fn   = f"clip_{clip_id[:8]}.mp4"
-            path = os.path.join(BASE_DIR, fn)
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    f.write(chunk)
-            sz = os.path.getsize(path)
-            szm = f"{sz/1_000_000:.1f} MB" if sz > 1_000_000 else f"{sz:,} bytes"
-            print(f"  🎬  Saved: {path}  ({szm})")
-            open_file(path)
-        elif r.status_code == 444:
-            print(f"  ⚠️   Camera offline or unavailable for this operation")
-            try:
-                print(f"       {r.json()}")
-            except Exception:
-                print(f"       {r.text[:200]}")
-        else:
-            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
-        return
 
     for name, cam_info in cams.items():
         print(f"\n── Events: {name} (last {limit}) ────────────────────────────")
@@ -810,7 +781,7 @@ def cmd_snapshot(cfg: dict, args) -> None:
 
 
 def cmd_download(cfg: dict, args) -> None:
-    """Bulk-download all events (snaps + clips) for a camera."""
+    """Bulk-download all event snapshots for a camera."""
     token    = get_token(cfg)
     session  = make_session(token)
     session.headers["Accept"] = "*/*"
@@ -818,8 +789,6 @@ def cmd_download(cfg: dict, args) -> None:
     cams     = resolve_cam(cfg, getattr(args, "cam", None))
 
     limit       = getattr(args, "limit",      None)
-    snaps_only  = getattr(args, "snaps_only",  False)
-    clips_only  = getattr(args, "clips_only",  False)
     re_download = getattr(args, "re_download", False)
 
     start = datetime.datetime.now()
@@ -847,62 +816,34 @@ def cmd_download(cfg: dict, args) -> None:
         events = r.json()
         print(f"  Found {len(events)} events\n")
 
-        snaps_dl = clips_dl = snaps_skip = clips_skip = snaps_miss = clips_miss = 0
+        snaps_dl = snaps_skip = snaps_miss = 0
 
         for i, ev in enumerate(events):
             img_url  = ev.get("imageUrl")
-            clip_url = ev.get("videoClipUrl")
             ts       = ev.get("timestamp", "")[:19]
             etype    = ev.get("eventType", "")
             print(f"  [{i+1}/{len(events)}]  {ts}  {etype}")
 
             # ── Snapshot ──────────────────────────────────────────────────────
-            if not clips_only:
-                if img_url:
-                    fn   = build_filename(ev, "jpg")
-                    dest = os.path.join(folder, fn)
-                    if os.path.exists(dest) and not re_download:
-                        print(f"    ⏭️   Skip: {fn}")
-                        snaps_skip += 1
-                    else:
-                        time.sleep(DELAY)
-                        rr = session.get(img_url, timeout=60, stream=True)
-                        if rr.status_code == 200:
-                            with open(dest, "wb") as f:
-                                for chunk in rr.iter_content(65536):
-                                    f.write(chunk)
-                            print(f"    💾  {fn}  ({os.path.getsize(dest):,} bytes)")
-                            snaps_dl += 1
-                        else:
-                            print(f"    ❌  snap HTTP {rr.status_code}")
+            if img_url:
+                fn   = build_filename(ev, "jpg")
+                dest = os.path.join(folder, fn)
+                if os.path.exists(dest) and not re_download:
+                    print(f"    ⏭️   Skip: {fn}")
+                    snaps_skip += 1
                 else:
-                    snaps_miss += 1
-
-            # ── Video clip ────────────────────────────────────────────────────
-            if not snaps_only:
-                if clip_url and ev.get("videoClipUploadStatus") == "Done":
-                    fn   = build_filename(ev, "mp4")
-                    dest = os.path.join(folder, fn)
-                    if os.path.exists(dest) and not re_download:
-                        print(f"    ⏭️   Skip: {fn}")
-                        clips_skip += 1
+                    time.sleep(DELAY)
+                    rr = session.get(img_url, timeout=60, stream=True)
+                    if rr.status_code == 200:
+                        with open(dest, "wb") as f:
+                            for chunk in rr.iter_content(65536):
+                                f.write(chunk)
+                        print(f"    💾  {fn}  ({os.path.getsize(dest):,} bytes)")
+                        snaps_dl += 1
                     else:
-                        time.sleep(DELAY)
-                        rr = session.get(clip_url, timeout=120, stream=True)
-                        if rr.status_code == 200:
-                            with open(dest, "wb") as f:
-                                for chunk in rr.iter_content(65536):
-                                    f.write(chunk)
-                            sz = os.path.getsize(dest)
-                            szm = f"{sz/1_000_000:.1f} MB" if sz > 1_000_000 else f"{sz:,} bytes"
-                            print(f"    🎬  {fn}  ({szm})")
-                            clips_dl += 1
-                        else:
-                            print(f"    ❌  clip HTTP {rr.status_code}")
-                elif not clip_url:
-                    clips_miss += 1
-                else:
-                    print(f"    ⏳  Clip not ready: {ev.get('videoClipUploadStatus')}")
+                        print(f"    ❌  snap HTTP {rr.status_code}")
+            else:
+                snaps_miss += 1
 
         # Mark all downloaded events as read on the Bosch cloud
         read_ids = [ev.get("id") for ev in events if ev.get("id")]
@@ -916,10 +857,7 @@ def cmd_download(cfg: dict, args) -> None:
                 pass
 
         print(f"\n  ✅  Summary — {name}:")
-        if not clips_only:
-            print(f"      Snapshots: {snaps_dl} downloaded, {snaps_skip} skipped, {snaps_miss} no image")
-        if not snaps_only:
-            print(f"      Clips:     {clips_dl} downloaded, {clips_skip} skipped, {clips_miss} no clip")
+        print(f"      Snapshots: {snaps_dl} downloaded, {snaps_skip} skipped, {snaps_miss} no image")
 
     elapsed = datetime.datetime.now() - start
     print(f"\n🏁  Done in {elapsed.seconds}s")
@@ -3464,8 +3402,6 @@ def cmd_menu(cfg: dict) -> None:
         action  = None
         sub     = None
         limit   = None
-        snaps_only  = False
-        clips_only  = False
         re_download = False
         live    = False
         vlc     = False
@@ -4418,110 +4354,6 @@ def cmd_account(cfg: dict, args) -> None:
     print()
 
 
-def cmd_clip_request(cfg: dict, args) -> None:
-    """Re-request video clip upload from camera local storage.
-
-    Usage:
-      python3 bosch_camera.py clip-request <cam> [--event-id ID]
-      python3 bosch_camera.py clip-request <cam> --last N
-
-    API: POST /v11/events/{eventId}/clip_request
-    """
-    token   = get_token(cfg)
-    session = make_session(token)
-    cameras = get_cameras(cfg, session)
-    cams    = resolve_cam(cfg, getattr(args, "cam", None))
-
-    event_id  = getattr(args, "event_id", None)
-    last_n    = getattr(args, "last", None)
-
-    if len(cams) != 1 and not event_id:
-        print("❌  Specify a single camera name (or use --event-id directly).")
-        return
-
-    if event_id:
-        # Direct event ID mode — re-request one specific clip
-        print(f"\n── Requesting clip for event {event_id} ──")
-        r = session.post(
-            f"{CLOUD_API}/v11/events/{event_id}/clip_request",
-            timeout=15,
-        )
-        if r.status_code in (200, 201, 204):
-            print(f"  ✅  Clip re-request sent for event {event_id}")
-            print(f"      Status will change to 'Pending' → 'Done' when upload completes.")
-        elif r.status_code == 442:
-            print(f"  ⚠️  Endpoint not supported (HTTP 442)")
-        else:
-            code = ""
-            try:
-                data = r.json()
-                code = f" (error {data.get('errorCode', '')})" if isinstance(data, dict) else ""
-            except Exception:
-                pass
-            print(f"  ❌  HTTP {r.status_code}{code}")
-            if r.status_code == 400:
-                print(f"      Error -353 = clip cannot be requested (recording overwritten or too old)")
-        return
-
-    # Find events with Unavailable clips for the camera
-    name, cam_info = next(iter(cams.items()))
-    cam_id = cam_info["id"]
-    limit  = last_n or 10
-
-    print(f"\n── Checking last {limit} events for {name} ──")
-    r = session.get(
-        f"{CLOUD_API}/v11/events",
-        params={"videoInputId": cam_id, "limit": limit},
-        timeout=15,
-    )
-    if r.status_code != 200:
-        print(f"  ❌  Failed to fetch events: HTTP {r.status_code}")
-        return
-
-    events = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
-    unavailable = [
-        e for e in events
-        if e.get("videoClipUploadStatus") in ("Unavailable", "Failed", None)
-        and e.get("videoClipUrl")
-    ]
-
-    if not unavailable:
-        all_done = [e for e in events if e.get("videoClipUploadStatus") == "Done"]
-        print(f"  ℹ️  No clips with status 'Unavailable' found in last {limit} events.")
-        print(f"      {len(all_done)} clips already uploaded, {len(events) - len(all_done)} without clip URL.")
-        return
-
-    print(f"  Found {len(unavailable)} event(s) with unavailable clips:\n")
-    requested = 0
-    for ev in unavailable:
-        ev_id   = ev.get("id", "?")
-        ev_ts   = ev.get("timestamp", "?")
-        ev_type = ev.get("eventType", "?")
-        status  = ev.get("videoClipUploadStatus", "?")
-
-        print(f"  📹  {ev_ts}  {ev_type}  (status: {status})")
-        r = session.post(
-            f"{CLOUD_API}/v11/events/{ev_id}/clip_request",
-            timeout=15,
-        )
-        if r.status_code in (200, 201, 204):
-            print(f"      ✅ Clip re-request sent")
-            requested += 1
-        else:
-            code = ""
-            try:
-                data = r.json()
-                code = f" (error {data.get('errorCode', '')})" if isinstance(data, dict) else ""
-            except Exception:
-                pass
-            print(f"      ❌ HTTP {r.status_code}{code}")
-        time.sleep(DELAY)
-
-    print(f"\n  Done: {requested}/{len(unavailable)} clip(s) re-requested.")
-    if requested > 0:
-        print(f"  Poll with 'events {name}' to check when clips become 'Done'.")
-
-
 def cmd_timestamp(cfg: dict, args) -> None:
     """Get or set time/date overlay on camera video.
 
@@ -4867,15 +4699,14 @@ def main():
     # ── download ───────────────────────────────────────────────────────────────
     p_dl = subparsers.add_parser(
         "download",
-        help="Bulk-download all events (JPEG snapshots + MP4 clips)",
+        help="Bulk-download all event snapshots (JPEG)",
         description=(
-            "💾  download — Bulk-download all events\n"
+            "💾  download — Bulk-download all event snapshots\n"
             "\n"
-            "  Downloads every event's JPEG snapshot and MP4 video clip\n"
+            "  Downloads every event's JPEG snapshot\n"
             "  from the cloud events API into a per-camera subfolder.\n"
             "\n"
-            "  Already-downloaded files are skipped by default.\n"
-            "  Only clips with videoClipUploadStatus=Done are downloaded."
+            "  Already-downloaded files are skipped by default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -4883,8 +4714,7 @@ def main():
             "    python3 bosch_camera.py download\n"
             "    python3 bosch_camera.py download Garten\n"
             "    python3 bosch_camera.py download Garten --limit 50\n"
-            "    python3 bosch_camera.py download Garten --clips-only\n"
-            "    python3 bosch_camera.py download --snaps-only --re-download"
+            "    python3 bosch_camera.py download --re-download"
         ),
     )
     p_dl.add_argument(
@@ -4899,16 +4729,6 @@ def main():
         default=None,
         metavar="N",
         help="Maximum number of events to process (default: all)",
-    )
-    p_dl.add_argument(
-        "--snaps-only",
-        action="store_true",
-        help="Download only JPEG snapshots, skip MP4 clips",
-    )
-    p_dl.add_argument(
-        "--clips-only",
-        action="store_true",
-        help="Download only MP4 video clips, skip JPEG snapshots",
     )
     p_dl.add_argument(
         "--re-download",
@@ -4947,11 +4767,6 @@ def main():
         default=None,
         metavar="N",
         help="Number of events to show (default: 10)",
-    )
-    p_ev.add_argument(
-        "--clip",
-        metavar="EVENT_ID",
-        help="Download the MP4 video clip for a specific event ID",
     )
 
     # ── privacy ────────────────────────────────────────────────────────────────
@@ -5425,27 +5240,6 @@ def main():
     )
     p_unread.add_argument("cam", nargs="?", help="Camera name (optional, all cameras if omitted)")
 
-    # ── clip-request ─────────────────────────────────────────────────────────
-    p_clip = subparsers.add_parser(
-        "clip-request",
-        help="Re-request video clip upload from camera local storage",
-        description=(
-            "📹  clip-request — Re-request video clip from camera\n"
-            "\n"
-            "  When an event has videoClipUploadStatus 'Unavailable' (Bosch didn't\n"
-            "  generate the clip), this command tells the camera to re-upload the\n"
-            "  video from its local SD storage.\n"
-            "\n"
-            "  Without --event-id, scans the last N events for unavailable clips.\n"
-            "  Error -353 means the recording is already overwritten on the camera."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_clip.add_argument("cam", nargs="?", help="Camera name")
-    p_clip.add_argument("--event-id", help="Re-request a specific event ID")
-    p_clip.add_argument("--last", type=int, default=10,
-                        help="Check last N events for unavailable clips (default: 10)")
-
     # ── privacy-sound ─────────────────────────────────────────────────────
     p_psound = subparsers.add_parser(
         "privacy-sound",
@@ -5715,8 +5509,8 @@ def main():
     # so all cmd_* functions can safely use getattr(args, "...", default).
     _defaults = dict(
         cam=None, action=None, sub=None, sub_arg=None, share_cam=None,
-        limit=None, clip=None,
-        snaps_only=False, clips_only=False, re_download=False,
+        limit=None,
+        re_download=False,
         live=False, vlc=False, full=False, minutes=None,
         interval=30, duration=0,
         enable=False, disable=False, sensitivity=None,
@@ -5774,7 +5568,6 @@ def main():
         "autofollow":    cmd_autofollow,
         "siren":         cmd_siren,
         "unread":        cmd_unread,
-        "clip-request":  cmd_clip_request,
         "privacy-sound": cmd_privacy_sound,
         "rules":         cmd_rules,
         "friends":       cmd_friends,
