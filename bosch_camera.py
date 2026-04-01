@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bosch Smart Home Camera — All-in-one Standalone Tool
-Version: 5.1.0
+Version: 7.0.0
 =====================================================
 No hardcoded camera IDs or credentials.
 All configuration is stored in bosch_config.json (created on first run).
@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "5.2.0"
+VERSION     = "7.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1008,6 +1008,70 @@ def _live_snap_loop(snap_url: str, cam_name: str, interval: float = 1.0) -> None
         print(f"\n  ⏹️   Live view stopped.")
 
 
+def _start_tls_proxy_sync(cam_host: str, cam_port: int) -> int:
+    """Start a local TCP→TLS proxy in a background thread. Returns the local port.
+
+    Bosch cameras use RTSPS (RTSP over TLS) with a self-signed certificate.
+    FFmpeg cannot skip TLS verification for RTSP Digest auth properly.
+    This proxy accepts plain TCP from FFmpeg and forwards to the camera over TLS.
+    FFmpeg handles Digest auth itself — the proxy only unwraps TLS.
+    """
+    import ssl
+    import socket
+    import threading
+    import select as _select
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(2)
+
+    def _proxy_thread():
+        while True:
+            try:
+                client, _ = srv.accept()
+            except OSError:
+                break
+            try:
+                raw = socket.create_connection((cam_host, cam_port), timeout=10)
+                tls = ctx.wrap_socket(raw, server_hostname=cam_host)
+            except Exception:
+                client.close()
+                continue
+
+            def _pipe(src, dst):
+                try:
+                    while True:
+                        r, _, _ = _select.select([src], [], [], 30)
+                        if not r:
+                            break
+                        data = src.recv(65536)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except Exception:
+                    pass
+                finally:
+                    try: src.close()
+                    except Exception: pass
+                    try: dst.close()
+                    except Exception: pass
+
+            t1 = threading.Thread(target=_pipe, args=(client, tls), daemon=True)
+            t2 = threading.Thread(target=_pipe, args=(tls, client), daemon=True)
+            t1.start()
+            t2.start()
+
+    t = threading.Thread(target=_proxy_thread, daemon=True)
+    t.start()
+    return port
+
+
 def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "", use_vlc: bool = False) -> None:
     """
     Open live audio+video stream via rtsps:// (RTSP over TLS on port 443).
@@ -1089,6 +1153,113 @@ def _open_rtsps_stream(rtsps_url: str, cam_name: str, fallback_snap_url: str = "
         print(f"\n  ⏹️   Live view stopped.")
 
 
+def cmd_test_local(cfg: dict, args) -> None:
+    """Test LOCAL vs REMOTE connection — dumps full API response, snap timing, RTSP URL.
+
+    Calls PUT /connection with both types and prints:
+      • Full raw JSON response (user, password, urls, imageUrlScheme, ...)
+      • snap.jpg timing and result
+      • Local RTSP URL to try in VLC/ffplay
+
+    Use this to verify LOCAL streaming works and measure the 15-second startup issue.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cams    = resolve_cam(cfg, getattr(args, "cam", None))
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n{'─'*60}")
+        print(f"  TEST LOCAL CONNECTION: {name}")
+        print(f"  Camera ID: {cam_id}")
+        print(f"{'─'*60}")
+        url = f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection"
+
+        for conn_type in ["LOCAL", "REMOTE"]:
+            print(f"\n  ─── type={conn_type} ───────────────────────────")
+            t0 = time.time()
+            r = session.put(
+                url,
+                json={"type": conn_type, "highQualityVideo": False},
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            elapsed = time.time() - t0
+            print(f"  PUT /connection → HTTP {r.status_code}  ({elapsed:.2f}s)")
+
+            if r.status_code not in (200, 201):
+                print(f"  Response body: {r.text[:400]}")
+                continue
+
+            data = r.json()
+            print(f"  Full response:\n{json.dumps(data, indent=4)}")
+
+            urls_list = data.get("urls", [])
+            user      = data.get("user", "")
+            password  = data.get("password", "")
+            scheme    = data.get("imageUrlScheme", "https://{url}/snap.jpg")
+
+            if not urls_list:
+                print("  ⚠️   No URLs in response.")
+                continue
+
+            snap_url = scheme.replace("{url}", urls_list[0])
+            print(f"\n  snap.jpg: {snap_url}")
+            t1 = time.time()
+            try:
+                if user and password:
+                    from requests.auth import HTTPDigestAuth
+                    sr = requests.get(snap_url, auth=HTTPDigestAuth(user, password),
+                                      verify=False, timeout=15)
+                else:
+                    sr = requests.get(snap_url, verify=False, timeout=15)
+                snap_elapsed = time.time() - t1
+                ct = sr.headers.get("Content-Type", "")
+                print(f"  snap.jpg → HTTP {sr.status_code}  ({snap_elapsed:.2f}s)  {ct}")
+                if sr.status_code == 200 and "image" in ct:
+                    fn   = f"test_{conn_type.lower()}_{name}.jpg"
+                    path = os.path.join(BASE_DIR, fn)
+                    with open(path, "wb") as f:
+                        f.write(sr.content)
+                    print(f"  ✅  Saved: {path}  ({len(sr.content):,} bytes)")
+                    open_file(path)
+            except Exception as e:
+                print(f"  ⚠️   snap.jpg error: {e}")
+
+            # Build RTSP URL — use videoUrlScheme from API response
+            u = urls_list[0]
+            video_scheme = data.get("videoUrlScheme", "")
+            if "/" in u:
+                # REMOTE: "proxy-NN.live.cbs.boschsecurity.com:42090/{hash}"
+                host_port, hash_path = u.split("/", 1)
+                proxy_host = host_port.split(":")[0]
+                rtsp_url = (
+                    f"rtsps://{proxy_host}:443/{hash_path}"
+                    f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=3600"
+                )
+            else:
+                # LOCAL: "192.168.x.x:443" — plain rtsp://, credentials URL-encoded
+                from urllib.parse import quote as _q
+                auth_prefix = f"{_q(user, safe='')}:{_q(password, safe='')}@" if user and password else ""
+                rtsp_url = (
+                    f"rtsp://{auth_prefix}{u}"
+                    f"/rtsp_tunnel?inst=2&enableaudio=1&fmtp=1&maxSessionDuration=3600"
+                )
+            print(f"\n  RTSP URL:  {rtsp_url}")
+            if video_scheme:
+                full_url = video_scheme.replace("{url}", u)
+                if user and password and "://" in full_url:
+                    scheme_part, rest = full_url.split("://", 1)
+                    full_url = f"{scheme_part}://{user}:{password}@{rest}"
+                print(f"  API scheme: {full_url}")
+
+            if getattr(args, "play", False):
+                print(f"  ▶️   Opening stream...")
+                _open_rtsps_stream(rtsp_url, name, snap_url)
+
+        print()
+
+
 def cmd_live(cfg: dict, args) -> None:
     """Open live stream — tries PUT /connection → open VLC on success.
 
@@ -1127,8 +1298,11 @@ def cmd_live(cfg: dict, args) -> None:
         result      = None
         result_type = ""
 
-        # Always use REMOTE for RTSP (LOCAL gives LAN IP which doesn't support RTSP tunnel)
-        for type_val in ["REMOTE", "LOCAL"]:
+        # --local flag forces LOCAL (direct LAN); default is REMOTE (cloud proxy).
+        # LOCAL response gives user/password + LAN IP — credentials embedded in RTSP URL.
+        force_local = getattr(args, "local", False)
+        type_candidates = ["LOCAL"] if force_local else ["REMOTE", "LOCAL"]
+        for type_val in type_candidates:
             r = session.put(
                 url,
                 json={"type": type_val, "highQualityVideo": hq},
@@ -1165,16 +1339,29 @@ def cmd_live(cfg: dict, args) -> None:
             save_config(cfg)
 
             if urls:
-                # Build rtsps:// URL on port 443 — the proxy serves real RTSP/1.0 over
-                # TLS on port 443 (port 42090 silently drops all RTSP connections).
-                # No auth needed — the hash in the path is the credential.
-                u = urls[0]  # e.g. proxy-20.live.cbs.boschsecurity.com:42090/{hash}
-                host_port, hash_path = u.split("/", 1)
-                proxy_host = host_port.split(":")[0]
-                rtsps_url = (
-                    f"rtsps://{proxy_host}:443/{hash_path}"
-                    f"/rtsp_tunnel?inst={inst}&enableaudio=1&fmtp=1&maxSessionDuration=3600"
-                )
+                u = urls[0]
+                if "/" in u:
+                    # REMOTE: "proxy-NN.live.cbs.boschsecurity.com:42090/{hash}"
+                    # Port 42090 drops RTSP; use port 443 instead.
+                    host_port, hash_path = u.split("/", 1)
+                    proxy_host = host_port.split(":")[0]
+                    rtsps_url = (
+                        f"rtsps://{proxy_host}:443/{hash_path}"
+                        f"/rtsp_tunnel?inst={inst}&enableaudio=1&fmtp=1&maxSessionDuration=3600"
+                    )
+                else:
+                    # LOCAL: "192.168.x.x:443" — camera uses TLS with self-signed cert
+                    # + Digest auth. FFmpeg can't do RTSPS+Digest with self-signed certs,
+                    # so we start a local TCP→TLS proxy and point FFmpeg at plain rtsp://.
+                    from urllib.parse import quote as _q
+                    cam_host, cam_port = u.split(":")
+                    proxy_port = _start_tls_proxy_sync(cam_host, int(cam_port))
+                    auth_prefix = f"{_q(user, safe='')}:{_q(password, safe='')}@" if user and password else ""
+                    rtsps_url = (
+                        f"rtsp://{auth_prefix}127.0.0.1:{proxy_port}"
+                        f"/rtsp_tunnel?inst={inst}&enableaudio=1&fmtp=1&maxSessionDuration=3600"
+                    )
+                    print(f"  🏠  Local stream ({u}) via TLS proxy :{proxy_port}")
                 print(f"  📡  RTSPS URL: {rtsps_url}")
                 _open_rtsps_stream(rtsps_url, name, proxy_url, use_vlc=getattr(args, "vlc", False))
             else:
@@ -3303,16 +3490,10 @@ def cmd_menu(cfg: dict) -> None:
         print(f"  {i})  Live stream — {name} (VLC, audio+video)")
         offset += 1
 
-    dl_start = offset
+    live_local_start = offset
     for i, name in enumerate(cam_names, start=offset):
-        print(f"  {i})  Download ALL events — {name}")
+        print(f"  {i})  Live stream LOCAL — {name} (LAN, TLS proxy)")
         offset += 1
-    print(f"  {offset})  Download ALL events — ALL cameras")
-    offset += 1
-
-    print(f"  {offset})  Show recent events — ALL cameras (last 20)")
-    events_item = offset
-    offset += 1
 
     # ── Camera controls ───────────────────────────────────────────────────────
     print()
@@ -3392,7 +3573,7 @@ def cmd_menu(cfg: dict) -> None:
     print(f"  {offset})  Re-scan cameras")
     rescan_item = offset
     offset += 1
-    print("  0)  Exit")
+    print("  q)  Exit")
     print()
 
     choice = input("  Enter choice: ").strip()
@@ -3405,18 +3586,21 @@ def cmd_menu(cfg: dict) -> None:
         re_download = False
         live    = False
         vlc     = False
+        local   = False
         full    = False
         minutes = None
 
     a = A()
+
+    if choice.lower() in ("q", "quit", "exit", "0"):
+        sys.exit(0)
+
     try:
         c = int(choice)
     except ValueError:
         return  # empty Enter or invalid → just redraw menu
 
-    if c == 0:
-        sys.exit(0)
-    elif c == 1:        cmd_status(cfg, a)
+    if c == 1:          cmd_status(cfg, a)
     elif c == 2:        cmd_info(cfg, a)
     elif 3 <= c < 3 + len(cam_names):
         a.cam = cam_names[c - 3]
@@ -3437,14 +3621,11 @@ def cmd_menu(cfg: dict) -> None:
         a.cam = cam_names[c - live_vlc_start]
         a.vlc = True
         cmd_live(cfg, a)
-    elif dl_start <= c < dl_start + len(cam_names):
-        a.cam = cam_names[c - dl_start]
-        cmd_download(cfg, a)
-    elif c == dl_start + len(cam_names):
-        cmd_download(cfg, a)
-    elif c == events_item:
-        a.limit = 20
-        cmd_events(cfg, a)
+    elif live_local_start <= c < live_local_start + len(cam_names):
+        a.cam = cam_names[c - live_local_start]
+        a.local = True
+        a.quality = "high"  # LOCAL always best quality
+        cmd_live(cfg, a)
     # Privacy
     elif privacy_start <= c < privacy_start + len(cam_names) * 2:
         idx = c - privacy_start
@@ -4677,6 +4858,33 @@ def main():
         metavar="Q",
         help="Quality preset: auto (inst=2, default) | high (inst=1, 30Mbps) | low (inst=4, 1.9Mbps)",
     )
+    p_live.add_argument(
+        "--local",
+        action="store_true",
+        help="Force LOCAL connection type (direct LAN stream with credentials)",
+    )
+
+    # ── test-local ─────────────────────────────────────────────────────────────
+    p_testlocal = subparsers.add_parser(
+        "test-local",
+        help="Test LOCAL vs REMOTE connection — full response dump + snap timing + RTSP URL",
+        description=(
+            "🔬  test-local — Test LOCAL vs REMOTE connection\n"
+            "\n"
+            "  Calls PUT /connection with both LOCAL and REMOTE types and prints:\n"
+            "    • Full raw JSON response (user, password, urls, imageUrlScheme, ...)\n"
+            "    • snap.jpg HTTP status + timing\n"
+            "    • RTSPS URL to try manually in VLC or ffplay\n"
+            "\n"
+            "  Use this to verify LOCAL streaming works and diagnose the 15s startup issue.\n"
+            "  Add --play to immediately open the LOCAL stream in ffplay."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_testlocal.add_argument("cam", nargs="?", metavar="<camera>",
+                             help="Camera name or partial match (omit = first camera)")
+    p_testlocal.add_argument("--play", action="store_true",
+                             help="Open LOCAL RTSPS stream in ffplay after testing")
 
     # stream alias
     p_stream = subparsers.add_parser(
@@ -4696,78 +4904,7 @@ def main():
     p_stream.add_argument("--quality", choices=["auto", "high", "low"], metavar="Q",
                           help="Quality preset: auto | high (30Mbps) | low (1.9Mbps)")
 
-    # ── download ───────────────────────────────────────────────────────────────
-    p_dl = subparsers.add_parser(
-        "download",
-        help="Bulk-download all event snapshots (JPEG)",
-        description=(
-            "💾  download — Bulk-download all event snapshots\n"
-            "\n"
-            "  Downloads every event's JPEG snapshot\n"
-            "  from the cloud events API into a per-camera subfolder.\n"
-            "\n"
-            "  Already-downloaded files are skipped by default."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "  Examples:\n"
-            "    python3 bosch_camera.py download\n"
-            "    python3 bosch_camera.py download Garten\n"
-            "    python3 bosch_camera.py download Garten --limit 50\n"
-            "    python3 bosch_camera.py download --re-download"
-        ),
-    )
-    p_dl.add_argument(
-        "cam",
-        nargs="?",
-        metavar="<camera>",
-        help="Camera name or partial match (omit = all cameras)",
-    )
-    p_dl.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Maximum number of events to process (default: all)",
-    )
-    p_dl.add_argument(
-        "--re-download",
-        action="store_true",
-        help="Re-download files that already exist locally",
-    )
-
-    # ── events ─────────────────────────────────────────────────────────────────
-    p_ev = subparsers.add_parser(
-        "events",
-        help="Show recent event list (timestamps, types, status)",
-        description=(
-            "📋  events — Show recent event list\n"
-            "\n"
-            "  Lists the most recent motion/alarm events for a camera.\n"
-            "  Each row shows: timestamp, event type, and whether\n"
-            "  a snapshot (📸) or video clip (🎬) is available."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "  Examples:\n"
-            "    python3 bosch_camera.py events\n"
-            "    python3 bosch_camera.py events Garten\n"
-            "    python3 bosch_camera.py events Garten --limit 50"
-        ),
-    )
-    p_ev.add_argument(
-        "cam",
-        nargs="?",
-        metavar="<camera>",
-        help="Camera name or partial match (omit = all cameras)",
-    )
-    p_ev.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Number of events to show (default: 10)",
-    )
+    # "download" and "events" subcommands removed (Bosch request)
 
     # ── privacy ────────────────────────────────────────────────────────────────
     p_priv = subparsers.add_parser(
@@ -5555,8 +5692,7 @@ def main():
         "info":          cmd_info,
         "snapshot":      cmd_snapshot,
         "live":          cmd_live,
-        "download":      cmd_download,
-        "events":        cmd_events,
+        # "download" and "events" removed (Bosch request)
         "privacy":       cmd_privacy,
         "light":         cmd_light,
         "pan":           cmd_pan,
@@ -5581,6 +5717,7 @@ def main():
         "rescan":             cmd_rescan,
         "timestamp":          cmd_timestamp,
         "notification-types": cmd_notification_types,
+        "test-local":         cmd_test_local,
     }
     if cmd not in dispatch:
         print(f"❌  Unknown command '{cmd}'. Run without arguments for the menu.")
