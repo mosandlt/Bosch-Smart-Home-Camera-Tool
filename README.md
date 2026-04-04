@@ -1,6 +1,6 @@
 # Bosch Smart Home Camera — Python CLI Tool
 
-> **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras.
+> **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
 > No official API. No app needed after setup. **v7.0.0**
 
