@@ -1540,8 +1540,11 @@ automation:
 
 ## Known Limitations
 
+- **LOCAL stream startup delay (25–35s)** — the camera's H.264 encoder needs 25s (360 Innenkamera) to 35s (Eyes Außenkamera) after connection setup before producing valid frames. The stream will show a black screen initially, then start playing.
+- **Motion sensitivity changes revert after ~1s** — the camera's internal IVA rules engine overwrites cloud-set motion sensitivity via RCP. Not fixable via the API.
 - **Proxy session = 60 s** — after 60 seconds the proxy hash expires and
   the live stream stops. The `live` command opens a new session each time.
+  Note: Setting `maxSessionDuration=3600` in the RTSP URL extends the session to 60 minutes (confirmed working despite the 60s value in the PUT /connection response).
 - **Cloud dependency** — everything goes through `residential.cbs.boschsecurity.com`.
   There is no documented local API on the SHC for camera images.
 - **VLC needs ffmpeg** — the `live --vlc` option requires ffmpeg to proxy the stream,
