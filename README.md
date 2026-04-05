@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v7.0.0**
+> No official API. No app needed after setup. **v7.1.0**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -68,7 +68,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-- [What's New in v5.2.0](#whats-new-in-v520)
+- [What's New in v7.1.0](#whats-new-in-v710)
 - [How It Works](#how-it-works)
 - [Cloud API Reference](#cloud-api-reference)
 - [RCP Protocol — Low-Level Camera Reads](#rcp-protocol--low-level-camera-reads)
@@ -421,7 +421,16 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 
 ---
 
-## What's New in v7.0.0
+## What's New in v7.1.0
+
+**TCP keep-alive on TLS proxy sockets**
+All TLS proxy sockets now enable `SO_KEEPALIVE` with 10 s idle / 5 s interval / 3 probes — detects dead connections before the OS default timeout, preventing zombie proxy threads on LOCAL streams.
+
+**Directional select timeout**
+Separate read timeouts for camera-to-client (90 s, tolerates slow H.264 encoder startup) vs client-to-camera (10 s, detects client disconnect quickly). Improves stability of long-running LOCAL streams.
+
+<details>
+<summary><strong>v7.0.0</strong></summary>
 
 **LOCAL LAN streaming with TLS proxy**
 New `live --local` command streams directly from the camera over your local network — no cloud proxy needed. A built-in TLS proxy handles the camera's self-signed certificate and Digest authentication, which FFmpeg cannot process natively. Audio + video in HD quality (30 Mbps) by default on LAN.
@@ -431,6 +440,7 @@ The interactive menu now includes "Live stream LOCAL" entries for each camera. E
 
 **Code cleanup**
 Removed download and events commands (cloud event access removed). 123 lines of dead code cleaned up.
+</details>
 
 <details>
 <summary><strong>v5.2.0</strong></summary>
@@ -1574,6 +1584,8 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v7.1.0** | TCP keep-alive on TLS proxy sockets (10 s idle / 5 s interval / 3 probes). Directional select timeout for stable LOCAL streams. |
+| **v7.0.0** | LOCAL LAN streaming with TLS proxy. Menu: local stream entries + exit with "q". Code cleanup. |
 | **v5.2.0** | Fix live stream session duration (`maxSessionDuration=3600` — stream runs up to 60 min). |
 | **v5.1.0** | New commands: privacy-sound, rules, friends, rename, profile, account. HTTP 444 handling. |
 | v4.0.0 | Intercom (listen-only), siren command, unread events, person detection icon, mark-as-read, `--push-mode` flag |

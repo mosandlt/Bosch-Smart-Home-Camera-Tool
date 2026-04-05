@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "7.0.0"
+VERSION     = "7.1.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -919,15 +919,27 @@ def _start_tls_proxy_sync(cam_host: str, cam_port: int) -> int:
                 break
             try:
                 raw = socket.create_connection((cam_host, cam_port), timeout=10)
+                # TCP keep-alive to prevent OS from dropping idle connections
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                try:
+                    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                except (AttributeError, OSError):
+                    pass
                 tls = ctx.wrap_socket(raw, server_hostname=cam_host)
             except Exception:
                 client.close()
                 continue
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-            def _pipe(src, dst):
+            def _pipe(src, dst, is_cam_to_client=False):
                 try:
                     while True:
-                        r, _, _ = _select.select([src], [], [], 30)
+                        # CAM→Client: no timeout (dark scenes have sparse RTP)
+                        # Client→CAM: 120s timeout (FFmpeg sends periodic keepalive)
+                        timeout = None if is_cam_to_client else 120
+                        r, _, _ = _select.select([src], [], [], timeout)
                         if not r:
                             break
                         data = src.recv(65536)
@@ -942,8 +954,8 @@ def _start_tls_proxy_sync(cam_host: str, cam_port: int) -> int:
                     try: dst.close()
                     except Exception: pass
 
-            t1 = threading.Thread(target=_pipe, args=(client, tls), daemon=True)
-            t2 = threading.Thread(target=_pipe, args=(tls, client), daemon=True)
+            t1 = threading.Thread(target=_pipe, args=(client, tls, False), daemon=True)
+            t2 = threading.Thread(target=_pipe, args=(tls, client, True), daemon=True)
             t1.start()
             t2.start()
 
