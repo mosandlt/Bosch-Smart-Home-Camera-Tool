@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v7.4.0**
+> No official API. No app needed after setup. **v8.0.0**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -1601,6 +1601,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v8.0.0** | **Complete Gen1 Support.** All discovered Bosch Cloud API endpoints implemented — 100% coverage for Gen1 cameras. Includes: motion zones (`zones`), privacy masks (`privacy-masks`), lighting schedule (`lighting-schedule`), extended rules edit (`--name`/`--start`/`--end`/`--days`), friends/sharing, and all camera controls. Next milestone: Gen2 cameras + permanent local user (Summer 2026). |
 | **v7.4.0** | **Lighting schedule command** (`lighting-schedule`): view and modify light schedule for outdoor cameras (on/off times, motion trigger, darkness threshold). Supports `--on`, `--off`, `--motion`, `--threshold` parameters. |
 | **v7.3.0** | **Privacy masks command** (`privacy-masks`): list, set, and clear privacy mask zones via cloud API. Same coordinate system as motion zones (normalized 0.0–1.0). |
 | **v7.2.0** | **Motion zones command** (`zones`): list, set, and clear motion detection zones via cloud API (normalized 0.0–1.0 coordinates). **Rules edit extended:** `edit` now supports `--name`, `--start`, `--end`, `--days` in addition to `--active`/`--inactive`. HTTP 443 handling (privacy mode blocks zone access). |

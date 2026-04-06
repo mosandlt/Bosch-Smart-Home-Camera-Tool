@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "7.3.0"
+VERSION     = "8.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
