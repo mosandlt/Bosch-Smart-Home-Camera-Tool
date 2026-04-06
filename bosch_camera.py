@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "7.1.0"
+VERSION     = "7.2.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -3788,7 +3788,7 @@ def cmd_rules(cfg: dict, args) -> None:
     Usage:
       python3 bosch_camera.py rules [cam]                                            → list all rules
       python3 bosch_camera.py rules [cam] add --name NAME --start HH:MM --end HH:MM --days 0,1,2,3,4,5,6
-      python3 bosch_camera.py rules [cam] edit --id RULE_ID --active|--inactive
+      python3 bosch_camera.py rules [cam] edit --id RULE_ID [--active|--inactive] [--name NAME] [--start HH:MM] [--end HH:MM] [--days 0,1,2,3,4,5,6]
       python3 bosch_camera.py rules [cam] delete --id RULE_ID
 
     API: GET/POST/PUT/DELETE /v11/video_inputs/{id}/rules
@@ -3876,6 +3876,19 @@ def cmd_rules(cfg: dict, args) -> None:
                 target_rule["isActive"] = True
             if inactive:
                 target_rule["isActive"] = False
+            # Allow changing name, times, and weekdays
+            edit_name = getattr(args, "name", None)
+            edit_start = getattr(args, "start", None)
+            edit_end = getattr(args, "end", None)
+            edit_days = getattr(args, "days", None)
+            if edit_name:
+                target_rule["name"] = edit_name
+            if edit_start:
+                target_rule["startTime"] = edit_start if len(edit_start.split(":")) == 3 else f"{edit_start}:00"
+            if edit_end:
+                target_rule["endTime"] = edit_end if len(edit_end.split(":")) == 3 else f"{edit_end}:00"
+            if edit_days:
+                target_rule["weekdays"] = [int(d.strip()) for d in edit_days.split(",")]
 
             print(f"  ✏️   Updating rule: {rule_id}")
             pr = session.put(
@@ -4152,6 +4165,107 @@ def cmd_friends(cfg: dict, args) -> None:
                 vid = sh.get("videoInputId", "?")
                 print(f"        • {vid}")
         print()
+
+
+def cmd_zones(cfg: dict, args) -> None:
+    """Manage motion detection zones (cloud API).
+
+    Usage:
+      python3 bosch_camera.py zones [cam]                  → list current zones
+      python3 bosch_camera.py zones [cam] set --json '[{"x":0.0,"y":0.3,"w":0.67,"h":0.7}]'
+      python3 bosch_camera.py zones [cam] clear             → remove all zones
+
+    API: GET/POST /v11/video_inputs/{id}/motion_sensitive_areas
+    Coordinates: normalized 0.0–1.0 (x, y = top-left corner, w = width, h = height)
+    Note: Returns HTTP 443 when privacy mode is active.
+    """
+    import json as _json
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    sub     = getattr(args, "sub", None)
+
+    ZONES_SUBS = ("set", "clear")
+    if cam_arg and cam_arg.lower() in ZONES_SUBS and not sub:
+        sub, cam_arg = cam_arg.lower(), None
+    if sub:
+        sub = sub.lower()
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Motion Zones: {name} ──────────────────────────────────────")
+
+        if sub == "set":
+            zones_json = getattr(args, "json", None)
+            if not zones_json:
+                print("  ❌  --json is required. Example: --json '[{\"x\":0.0,\"y\":0.3,\"w\":0.67,\"h\":0.7}]'")
+                continue
+            try:
+                zones = _json.loads(zones_json)
+            except _json.JSONDecodeError as e:
+                print(f"  ❌  Invalid JSON: {e}")
+                continue
+            if not isinstance(zones, list):
+                print("  ❌  Zones must be a JSON array of objects with x, y, w, h")
+                continue
+            for i, z in enumerate(zones):
+                for key in ("x", "y", "w", "h"):
+                    if key not in z:
+                        print(f"  ❌  Zone {i} missing '{key}'")
+                        continue
+            print(f"  ✏️   Setting {len(zones)} zone(s)...")
+            r = session.post(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion_sensitive_areas",
+                json=zones,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if r.status_code in (200, 204):
+                print(f"  ✅  {len(zones)} zone(s) set.")
+            elif r.status_code == 443:
+                print(f"  ⚠️   Not available (HTTP 443) — privacy mode may be active.")
+            else:
+                print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+            continue
+
+        if sub == "clear":
+            print(f"  🗑️   Clearing all zones...")
+            r = session.post(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion_sensitive_areas",
+                json=[],
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if r.status_code in (200, 204):
+                print(f"  ✅  All zones cleared.")
+            elif r.status_code == 443:
+                print(f"  ⚠️   Not available (HTTP 443) — privacy mode may be active.")
+            else:
+                print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+            continue
+
+        # Default: list zones
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/motion_sensitive_areas", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code == 443:
+            print(f"  ⚠️   Not available (HTTP 443) — privacy mode may be active.")
+            continue
+        if r.status_code != 200:
+            print(f"  ❌  Could not fetch zones: HTTP {r.status_code}")
+            continue
+        zones = r.json()
+        if not zones:
+            print(f"  (no motion zones configured)")
+            continue
+        print(f"  {len(zones)} zone(s):\n")
+        for i, z in enumerate(zones):
+            print(f"  Zone {i+1}: x={z.get('x', 0):.4f}  y={z.get('y', 0):.4f}  w={z.get('w', 0):.4f}  h={z.get('h', 0):.4f}")
+        print(f"\n  JSON: {_json.dumps(zones)}")
 
 
 def cmd_rename(cfg: dict, args) -> None:
@@ -5599,6 +5713,7 @@ def main():
         "privacy-sound": cmd_privacy_sound,
         "rules":         cmd_rules,
         "friends":       cmd_friends,
+        "zones":         cmd_zones,
         "rename":        cmd_rename,
         "profile":       cmd_profile,
         "account":       cmd_account,
