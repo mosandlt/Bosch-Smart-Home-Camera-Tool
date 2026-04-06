@@ -4364,6 +4364,91 @@ def cmd_privacy_masks(cfg: dict, args) -> None:
         print(f"\n  JSON: {_json.dumps(masks)}")
 
 
+def cmd_lighting_schedule(cfg: dict, args) -> None:
+    """View or modify the lighting schedule for cameras with LED light.
+
+    Usage:
+      python3 bosch_camera.py lighting-schedule [cam]      → show current schedule
+      python3 bosch_camera.py lighting-schedule [cam] set --on HH:MM --off HH:MM [--motion] [--threshold 0.0-1.0]
+
+    API: GET/PUT /v11/video_inputs/{id}/lighting_options
+    Only available for outdoor cameras (Eyes) with LED light.
+    """
+    token   = get_token(cfg)
+    session = make_session(token)
+    cameras = get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    sub     = getattr(args, "sub", None)
+
+    if cam_arg and cam_arg.lower() == "set" and not sub:
+        sub, cam_arg = "set", None
+    if sub:
+        sub = sub.lower()
+
+    cams = resolve_cam(cfg, cam_arg)
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Lighting Schedule: {name} ──────────────────────────────────")
+
+        if sub == "set":
+            # Fetch current first
+            r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/lighting_options", timeout=10)
+            if r.status_code != 200:
+                print(f"  ❌  Could not fetch: HTTP {r.status_code}")
+                continue
+            data = r.json()
+            on_time = getattr(args, "on", None)
+            off_time = getattr(args, "off", None)
+            motion = getattr(args, "motion", None)
+            threshold = getattr(args, "threshold", None)
+            if on_time:
+                data["generalLightOnTime"] = on_time if len(on_time.split(":")) == 3 else f"{on_time}:00"
+            if off_time:
+                data["generalLightOffTime"] = off_time if len(off_time.split(":")) == 3 else f"{off_time}:00"
+            if motion is not None:
+                data["lightOnMotion"] = motion
+            if threshold is not None:
+                data["darknessThreshold"] = float(threshold)
+            data["scheduleStatus"] = "FOLLOW_SCHEDULE"
+            print(f"  ✏️   Updating schedule...")
+            pr = session.put(
+                f"{CLOUD_API}/v11/video_inputs/{cam_id}/lighting_options",
+                json=data,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if pr.status_code in (200, 204):
+                print(f"  ✅  Schedule updated: {data.get('generalLightOnTime')} → {data.get('generalLightOffTime')}")
+            elif pr.status_code == 444:
+                print(f"  ⚠️   Camera offline.")
+            else:
+                print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+            continue
+
+        # Default: show schedule
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/lighting_options", timeout=10)
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code == 444:
+            print(f"  ⚠️   Camera offline.")
+            continue
+        if r.status_code == 442:
+            print(f"  ⚠️   Not supported on this camera model.")
+            continue
+        if r.status_code != 200:
+            print(f"  ❌  HTTP {r.status_code}")
+            continue
+        d = r.json()
+        print(f"  Modus:          {d.get('scheduleStatus', '?')}")
+        print(f"  Zeitplan:       {d.get('generalLightOnTime', '?')} → {d.get('generalLightOffTime', '?')}")
+        print(f"  Dunkelheit:     {d.get('darknessThreshold', '?')}")
+        print(f"  Bei Bewegung:   {'Ja' if d.get('lightOnMotion') else 'Nein'} ({d.get('lightOnMotionFollowUpTimeSeconds', 0)}s Nachlauf)")
+        print(f"  Frontlicht:     {'An' if d.get('frontIlluminatorInGeneralLightOn') else 'Aus'} (Intensität: {d.get('frontIlluminatorGeneralLightIntensity', '?')})")
+        print(f"  Wallwasher:     {'An' if d.get('wallwasherInGeneralLightOn') else 'Aus'}")
+
+
 def cmd_rename(cfg: dict, args) -> None:
     """Rename a camera via the Bosch cloud API.
 
@@ -5811,6 +5896,7 @@ def main():
         "friends":       cmd_friends,
         "zones":         cmd_zones,
         "privacy-masks": cmd_privacy_masks,
+        "lighting-schedule": cmd_lighting_schedule,
         "rename":        cmd_rename,
         "profile":       cmd_profile,
         "account":       cmd_account,
