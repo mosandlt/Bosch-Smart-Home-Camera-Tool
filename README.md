@@ -598,7 +598,7 @@ The API uses OAuth2 with JWT Bearer tokens issued by Bosch's Keycloak server.
 **Token properties:**
 - Issuer: `smarthome.authz.bosch.com`
 - Audience: `https://residential.cbs.boschsecurity.com/app`
-- Client ID: `residential_app`
+- Client ID: `oss_residential_app`
 - Lifetime: ~1 hour
 - Refresh token scope: `offline_access` → lasts very long (months)
 
@@ -608,7 +608,7 @@ The API uses OAuth2 with JWT Bearer tokens issued by Bosch's Keycloak server.
 1. Script generates code_verifier + code_challenge (SHA256, S256)
 2. Browser opens:
    https://smarthome.authz.bosch.com/auth/realms/home_auth_provider/
-   protocol/openid-connect/auth?client_id=residential_app&
+   protocol/openid-connect/auth?client_id=oss_residential_app&
    response_type=code&scope=email+offline_access+profile+openid&
    redirect_uri=https://www.bosch.com/boschcam&
    code_challenge=...&code_challenge_method=S256
@@ -1601,6 +1601,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v8.0.4** | **OSS OAuth credentials.** Switched to dedicated Bosch OSS OAuth client (`oss_residential_app`) — provided by Bosch for open source projects. Firebase/FCM API keys unchanged (OSS key lacks FCM permissions). Re-login required (`python3 get_token.py`). |
 | **v8.0.3** | **New commands + protocol check.** New: `accept-invite` (accept friend invitation), `shared` (show which friends have camera access). Protocol version check on startup (warns if Bosch API v11 unsupported). Feature flags in `info --full`. Dynamic hardware version display (human-readable names). |
 | **v8.0.0** | **Complete Gen1 Support.** All discovered Bosch Cloud API endpoints implemented — 100% coverage for Gen1 cameras. Includes: motion zones (`zones`), privacy masks (`privacy-masks`), lighting schedule (`lighting-schedule`), extended rules edit (`--name`/`--start`/`--end`/`--days`), friends/sharing, and all camera controls. Next milestone: Gen2 cameras + permanent local user (Summer 2026). |
 | **v7.4.0** | **Lighting schedule command** (`lighting-schedule`): view and modify light schedule for outdoor cameras (on/off times, motion trigger, darkness threshold). Supports `--on`, `--off`, `--motion`, `--threshold` parameters. |

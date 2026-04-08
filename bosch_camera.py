@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "8.0.3"
+VERSION     = "8.0.4"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -2085,6 +2085,8 @@ def _get_fcm_api_key() -> str:
 
     This is a public app-level key (not a secret) embedded in every copy of
     the Bosch Smart Camera APK. It identifies the app to Firebase, not the user.
+    The OSS Google API key from Bosch does NOT have Firebase/FCM permissions,
+    so we continue using the app-embedded Firebase key for push notifications.
     """
     import base64
     return base64.b64decode("QUl6YVN5QS1WOGEzR3hsZ1A0NTRzbzY3QzFJaDBQakpDd3pFMEFJ").decode()
