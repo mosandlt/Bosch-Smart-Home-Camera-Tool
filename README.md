@@ -68,7 +68,7 @@ of Bosch's software was distributed. Only network protocol observations were use
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
-- [What's New in v7.1.0](#whats-new-in-v710)
+- [What's New in v9.0.0](#whats-new-in-v900)
 - [How It Works](#how-it-works)
 - [Cloud API Reference](#cloud-api-reference)
 - [RCP Protocol — Low-Level Camera Reads](#rcp-protocol--low-level-camera-reads)
@@ -458,7 +458,7 @@ python3 bosch_camera.py rescan                   # re-discover cameras
 
 ---
 
-## What's New in v7.1.0
+## What's New in v9.0.0
 
 **TCP keep-alive on TLS proxy sockets**
 All TLS proxy sockets now enable `SO_KEEPALIVE` with 10 s idle / 5 s interval / 3 probes — detects dead connections before the OS default timeout, preventing zombie proxy threads on LOCAL streams.
@@ -1214,14 +1214,14 @@ DELETE /v11/alexa/link                       — unlink from Alexa
 
 ## Camera Models
 
-### Gen1 (current tool support)
+### Gen1 (fully supported)
 
 | Model ID | Type | Name |
 |----------|------|------|
 | `CAMERA_EYES` | Outdoor | Bosch Smart Home Eyes Outdoor Camera |
 | `CAMERA_360` | Indoor | Bosch Smart Home 360° Indoor Camera |
 
-### Gen2 (discovered in iOS app, separate SSL cert chains)
+### Gen2 (supported since v9.0.0)
 
 | Model ID | Type | Name |
 |----------|------|------|
