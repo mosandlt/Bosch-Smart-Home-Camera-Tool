@@ -96,9 +96,9 @@ def main():
     local_ip = get_local_ip()
     port = args.port
 
-    # Dump file location
+    # Dump file location — save to parent captures/ folder (not inside the git repo)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    dump_dir = os.path.join(script_dir, "captures")
+    dump_dir = os.path.join(script_dir, "..", "captures")
     os.makedirs(dump_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     dump_file = os.path.join(dump_dir, f"bosch_flows_{timestamp}.mitm")

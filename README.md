@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v8.0.3**
+> No official API. No app needed after setup. **v9.0.0**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -130,6 +130,26 @@ of Bosch's software was distributed. Only network protocol observations were use
 | **Notification type toggles** | `notification-types [cam] [--set movement=on person=off]` |
 | Automatic token via browser login | `get_token.py` |
 | Silent token renewal / token fix | `token [fix\|browser]` |
+
+---
+
+## Prerequisites — Setting Up a New Camera
+
+Before using this tool, your camera **must** be fully set up in the official **Bosch Smart Camera** app first.
+
+1. **Unbox and power on** the camera
+2. **Open the Bosch Smart Camera app** and follow the pairing wizard to add the camera to your account
+3. **Wait for the firmware update** — new cameras typically receive a Zero-Day update during first setup. This can take **up to 1 hour**. The camera's LED blinks yellow/green during the update.
+   - **Do not unplug or restart** the camera during the update
+   - If the LED blink pattern doesn't change after 1 hour, leave the camera alone for up to 24 hours ([Bosch Support](https://www.bosch-smarthome.com/de/de/support/hilfe/hilfe-zum-produkt/hilfe-zur-eyes-aussenkamera-2/))
+   - The app shows the update status — wait until it reports the camera as ready
+4. **Verify the camera works** in the Bosch app — check live stream, settings, and notifications
+5. **Then use this CLI tool** to control it (see Quick Start below)
+
+For more help with camera setup, see:
+- [Eyes Außenkamera II — Bosch Support](https://www.bosch-smarthome.com/de/de/support/hilfe/hilfe-zum-produkt/hilfe-zur-eyes-aussenkamera-2/)
+- [Eyes Innenkamera II — Bosch Support](https://www.bosch-smarthome.com/de/de/support/hilfe/hilfe-zum-produkt/hilfe-zur-eyes-innenkamera-2/)
+- [Firmware Update dauert lange — Bosch Community](https://community.bosch-smarthome.com/t5/technische-probleme/wie-lange-dauert-das-update-der-software-bei-mir-l%C3%A4uft-es-seit-%C3%BCber-20-minuten/td-p/71764)
 
 ---
 
@@ -1601,6 +1621,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v9.0.0** | **Gen2 camera support.** Gen2 model names (`CAMERA_OUTDOOR_GEN2`, `CAMERA_INDOOR_GEN2`, `HOME_Eyes_Outdoor`, `HOME_Eyes_Indoor`). Firmware update detection (`UPDATING_REGULAR` → 🔄). Proxy dump path fix. |
 | **v8.0.4** | **OSS OAuth credentials.** Switched to dedicated Bosch OSS OAuth client (`oss_residential_app`) — provided by Bosch for open source projects. Firebase/FCM API keys unchanged (OSS key lacks FCM permissions). Re-login required (`python3 get_token.py`). |
 | **v8.0.3** | **New commands + protocol check.** New: `accept-invite` (accept friend invitation), `shared` (show which friends have camera access). Protocol version check on startup (warns if Bosch API v11 unsupported). Feature flags in `info --full`. Dynamic hardware version display (human-readable names). |
 | **v8.0.0** | **Complete Gen1 Support.** All discovered Bosch Cloud API endpoints implemented — 100% coverage for Gen1 cameras. Includes: motion zones (`zones`), privacy masks (`privacy-masks`), lighting schedule (`lighting-schedule`), extended rules edit (`--name`/`--start`/`--end`/`--days`), friends/sharing, and all camera controls. Next milestone: Gen2 cameras + permanent local user (Summer 2026). |

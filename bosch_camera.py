@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "8.0.4"
+VERSION     = "9.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -74,6 +74,8 @@ HW_DISPLAY_NAMES = {
     "CAMERA_EYES": "Eyes Außenkamera",
     "HOME_Eyes_Outdoor": "Eyes Außenkamera II",
     "HOME_Eyes_Indoor": "Eyes Innenkamera II",
+    "CAMERA_OUTDOOR_GEN2": "Eyes Außenkamera II",
+    "CAMERA_INDOOR_GEN2": "Eyes Innenkamera II",
 }
 
 # ConnectionType enum — confirmed working values (discovered 2026-03-19)
@@ -525,7 +527,13 @@ def cmd_status(cfg: dict, args) -> None:
 
     for name, cam_info in cameras.items():
         status = api_ping(session, cam_info["id"])
-        icon   = "🟢" if status == "ONLINE" else "🔴"
+        if status == "ONLINE":
+            icon = "🟢"
+        elif status.startswith("UPDATING"):
+            icon = "🔄"
+            status = "UPDATING (firmware)"
+        else:
+            icon = "🔴"
         print(f"  {icon}  {name}")
         print(f"      ID:      {cam_info['id']}")
         print(f"      Model:   {cam_info['model']}   FW: {cam_info['firmware']}")
@@ -1188,7 +1196,12 @@ def cmd_live(cfg: dict, args) -> None:
     for name, cam_info in cams.items():
         print(f"\n── Live Stream: {name} ──────────────────────────────────────")
         status = api_ping(session, cam_info["id"])
-        icon   = "🟢" if status == "ONLINE" else "🔴"
+        if status == "ONLINE":
+            icon = "🟢"
+        elif status.startswith("UPDATING"):
+            icon = "🔄"
+        else:
+            icon = "🔴"
         print(f"  {icon}  Status: {status}")
 
         if status != "ONLINE":
@@ -1351,7 +1364,12 @@ def cmd_info(cfg: dict, args) -> None:
         name   = cam.get("title", cam.get("id"))
         cam_id = cam.get("id", "")
         status = cam.get("connectionStatus", "?")
-        icon   = "🟢" if status == "ONLINE" else "🔴"
+        if status == "ONLINE":
+            icon = "🟢"
+        elif status.startswith("UPDATING"):
+            icon = "🔄"
+        else:
+            icon = "🔴"
         model  = cam.get("hardwareVersion", "?")
         fw     = cam.get("firmwareVersion", "?")
         mac    = cam.get("macAddress", "?")
