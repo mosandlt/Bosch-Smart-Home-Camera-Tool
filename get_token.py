@@ -10,7 +10,8 @@ How it works:
   1. If a refresh_token is saved in bosch_config.json
      → renews access_token silently (no browser, no user interaction)
   2. Otherwise → opens a browser for a one-time login via SingleKey ID
-     → captures the auth code via a local HTTP callback server on localhost
+     → starts a local HTTP server on http://localhost:8321/callback
+     → Bosch Keycloak redirects back after login — code is captured automatically
      → exchanges it for access_token + refresh_token
      → saves both to bosch_config.json
 
@@ -51,7 +52,7 @@ CLIENT_ID     = "oss_residential_app"
 
 CLIENT_SECRET = base64.b64decode("RjFqWnpzRzVOdHc3eDJWVmM4SjZxZ3NuaXNNT2ZhWmc=").decode()
 SCOPES        = "email offline_access profile openid"
-REDIRECT_URI  = "https://www.bosch.com/boschcam"
+REDIRECT_URI  = "http://localhost:8321/callback"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -97,69 +98,105 @@ def _build_auth_url(code_challenge: str, state: str) -> str:
 
 def _wait_for_callback(timeout: int = 120) -> str | None:
     """
-    After login Bosch redirects to https://www.bosch.com/boschcam?code=...
-    The page shows 404 — that's expected. We need the auth code from the URL.
+    Start a local HTTP server on localhost:8321 to capture the OAuth callback.
 
-    On macOS: tries to read the URL from the clipboard automatically.
-    On all platforms: falls back to asking the user to paste the URL.
+    After login, Bosch Keycloak redirects to http://localhost:8321/callback?code=...
+    The server captures the auth code automatically and shows a success page.
     """
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    auth_code = None
+    error_msg = None
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal auth_code, error_msg
+            qs = parse_qs(urlparse(self.path).query)
+
+            err = qs.get("error", [None])[0]
+            if err:
+                error_msg = qs.get("error_description", [err])[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"<html><body><h2>Login Error</h2><p>{error_msg}</p></body></html>".encode())
+                return
+
+            auth_code = qs.get("code", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            if auth_code:
+                self.wfile.write(
+                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                    b"<h2 style='color:#2e7d32'>&#10004; Login successful!</h2>"
+                    b"<p>You can close this tab and return to the terminal.</p>"
+                    b"</body></html>"
+                )
+            else:
+                self.wfile.write(b"<html><body><h2>No auth code received.</h2></body></html>")
+
+        def log_message(self, format, *args):
+            pass  # suppress HTTP log noise
+
     print()
     print("  ┌─ Steps ──────────────────────────────────────────────────┐")
     print("  │  1. Log in with your Bosch SingleKey ID in the browser   │")
-    print("  │  2. The browser shows a 404 page — that is NORMAL        │")
-    print("  │  3. Copy the full URL from the browser address bar       │")
-    print("  │     It starts with: https://www.bosch.com/boschcam?code= │")
-    print("  │  4. Come back here and press Enter (or paste the URL)    │")
+    print("  │  2. After login, the browser redirects back here         │")
+    print("  │  3. The auth code is captured automatically              │")
     print("  └──────────────────────────────────────────────────────────┘")
     print()
 
-    # macOS: try clipboard automatically after a short wait
-    import subprocess as _sp, time as _time, sys as _sys
-    if _sys.platform == "darwin":
-        print("  ⏳  Waiting for you to copy the URL... (press Enter when ready)")
-        try:
-            input()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        # Read from clipboard
-        try:
-            raw = _sp.check_output(["pbpaste"], text=True).strip()
-            if "boschcam" in raw and "code=" in raw:
-                print(f"  📋  Read from clipboard: {raw[:60]}...")
-            else:
-                raw = ""
-        except Exception:
-            raw = ""
-    else:
-        raw = ""
+    try:
+        server = HTTPServer(("127.0.0.1", 8321), CallbackHandler)
+    except OSError as e:
+        print(f"  ❌  Cannot start callback server on port 8321: {e}")
+        return _wait_for_callback_manual()
 
-    if not raw:
-        print("  ➡️   Paste the full URL here:")
-        try:
-            raw = input("  URL: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
+    server.timeout = timeout
 
+    def serve():
+        server.handle_request()  # handle exactly one request
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    print(f"  ⏳  Waiting for login callback on http://localhost:8321/callback ...")
+    t.join(timeout=timeout)
+    server.server_close()
+
+    if error_msg:
+        print(f"  ❌  Login error: {error_msg}")
+        return None
+    if not auth_code:
+        print(f"  ❌  Timeout — no callback received within {timeout}s.")
+        return _wait_for_callback_manual()
+
+    print("  ✅  Auth code received automatically!")
+    return auth_code
+
+
+def _wait_for_callback_manual() -> str | None:
+    """Fallback: ask user to paste the redirect URL manually."""
+    print()
+    print("  ➡️   Paste the full redirect URL from your browser:")
+    try:
+        raw = input("  URL: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
     if not raw:
         return None
-
-    # Accept full URL or just the query string
     if "?" in raw:
         raw = raw.split("?", 1)[1]
-
     qs = parse_qs(raw)
     error = qs.get("error", [None])[0]
     if error:
-        desc = qs.get("error_description", [error])[0]
-        print(f"  ❌  Login error: {desc}")
+        print(f"  ❌  Login error: {qs.get('error_description', [error])[0]}")
         return None
-
     code = qs.get("code", [None])[0]
     if not code:
-        print("  ❌  No 'code' found in the URL.")
-        print(f"      Got: {raw[:200]}")
+        print(f"  ❌  No 'code' found in the URL.")
         return None
-
     return code
 
 
