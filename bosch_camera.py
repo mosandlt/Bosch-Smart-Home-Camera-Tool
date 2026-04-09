@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "9.0.0"
+VERSION     = "9.0.1"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1523,8 +1523,18 @@ def cmd_info(cfg: dict, args) -> None:
                 alr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/ambient_light_sensor_level", timeout=10)
                 if alr.status_code == 200:
                     ald = alr.json()
-                    level = ald.get("level", ald.get("ambientLightLevel", json.dumps(ald)))
-                    print(f"      Ambient light: level={level}")
+                    level = ald.get("ambientLightSensorLevel", ald.get("level", json.dumps(ald)))
+                    pct = f" ({round(float(level)*100)}%)" if isinstance(level, (int, float)) else ""
+                    print(f"      Ambient light: {level}{pct}")
+            except Exception:
+                pass
+
+            # /intrusionDetectionConfig (Gen2 only)
+            try:
+                idr = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/intrusionDetectionConfig", timeout=10)
+                if idr.status_code == 200:
+                    idd = idr.json()
+                    print(f"      Intrusion:     enabled={idd.get('enabled')}, mode={idd.get('detectionMode')}, sensitivity={idd.get('sensitivity')}, distance={idd.get('distance')}m")
             except Exception:
                 pass
 

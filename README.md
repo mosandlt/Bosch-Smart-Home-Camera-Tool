@@ -1621,6 +1621,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v9.0.1** | **Info: intrusion detection + ambient light fix.** `info --full` now shows `intrusionDetectionConfig` (enabled, detectionMode, sensitivity, distance) for Gen2 cameras. Fixed ambient light field name (`ambientLightSensorLevel`), shows percentage. |
 | **v9.0.0** | **Gen2 camera support.** Gen2 model names (`CAMERA_OUTDOOR_GEN2`, `CAMERA_INDOOR_GEN2`, `HOME_Eyes_Outdoor`, `HOME_Eyes_Indoor`). Firmware update detection (`UPDATING_REGULAR` → 🔄). Proxy dump path fix. |
 | **v8.0.4** | **OSS OAuth credentials.** Switched to dedicated Bosch OSS OAuth client (`oss_residential_app`) — provided by Bosch for open source projects. Firebase/FCM API keys unchanged (OSS key lacks FCM permissions). Re-login required (`python3 get_token.py`). |
 | **v8.0.3** | **New commands + protocol check.** New: `accept-invite` (accept friend invitation), `shared` (show which friends have camera access). Protocol version check on startup (warns if Bosch API v11 unsupported). Feature flags in `info --full`. Dynamic hardware version display (human-readable names). |
