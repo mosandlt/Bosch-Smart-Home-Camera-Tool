@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .DS_Store
 _live_stream.m3u
+test_local_*.jpg
+test_remote_*.jpg
