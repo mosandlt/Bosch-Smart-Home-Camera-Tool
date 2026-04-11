@@ -62,7 +62,7 @@ urllib3.disable_warnings()
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "9.0.2"
+VERSION     = "9.0.3"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -407,28 +407,22 @@ def api_get_events(session: requests.Session, cam_id: str, limit: int = 400) -> 
 
 
 def api_mark_events_read(session: requests.Session, event_ids: list[str]) -> bool:
-    """Mark events as read/seen on the Bosch cloud.
+    """Mark events as read on the Bosch cloud via PUT /v11/events.
 
-    Tries PUT /v11/events/bulk first, falls back to individual PUT /v11/events/{id}.
-    Returns True if at least one method succeeded.
+    The /v11/events/bulk endpoint only supports `{ids, action: "DELETE"}` —
+    there is no bulk mark-as-read. Returns True if at least one PUT succeeded.
     """
     if not event_ids:
         return True
 
-    # Try bulk update first
-    try:
-        body = {"events": [{"id": eid, "isSeen": True} for eid in event_ids]}
-        r = session.put(f"{CLOUD_API}/v11/events/bulk", json=body, timeout=10)
-        if r.status_code in (200, 204):
-            return True
-    except Exception:
-        pass
-
-    # Fallback: mark individually
     success = False
     for eid in event_ids:
         try:
-            r = session.put(f"{CLOUD_API}/v11/events/{eid}", json={"isSeen": True}, timeout=5)
+            r = session.put(
+                f"{CLOUD_API}/v11/events",
+                json={"id": eid, "isRead": True},
+                timeout=5,
+            )
             if r.status_code in (200, 204):
                 success = True
         except Exception:

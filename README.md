@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v9.0.2**
+> No official API. No app needed after setup. **v9.0.3**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -1621,6 +1621,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v9.0.3** | **Fix: Mark events as read uses correct API shape.** `api_mark_events_read` previously tried `PUT /v11/events/bulk` with body `{events: [{id, isSeen: true}]}` (wrong endpoint method, wrong key) and fell back to `PUT /v11/events/{id}` with `{isSeen: true}` (wrong path, wrong key). Network capture analysis showed the actual shape is `PUT /v11/events` with body `{id, isRead: true}` per event, and the bulk endpoint is `POST {ids, action: "DELETE"}` only. Function now sends per-event PUTs with the correct payload — events actually get marked as read on the cloud now. |
 | **v9.0.2** | **Automatic OAuth login.** `get_token.py` now uses a local HTTP callback server (`localhost:8321`) — after browser login, Bosch Keycloak redirects back automatically and the auth code is captured without manual URL copy-paste. Redirect URI `localhost:8321/callback` registered by Bosch for the OSS OAuth client. Falls back to manual paste if port is busy. |
 | **v9.0.1** | **Info: intrusion detection + ambient light fix.** `info --full` now shows `intrusionDetectionConfig` (enabled, detectionMode, sensitivity, distance) for Gen2 cameras. Fixed ambient light field name (`ambientLightSensorLevel`), shows percentage. |
 | **v9.0.0** | **Gen2 camera support.** Gen2 model names (`CAMERA_OUTDOOR_GEN2`, `CAMERA_INDOOR_GEN2`, `HOME_Eyes_Outdoor`, `HOME_Eyes_Indoor`). Firmware update detection (`UPDATING_REGULAR` → 🔄). Proxy dump path fix. |
