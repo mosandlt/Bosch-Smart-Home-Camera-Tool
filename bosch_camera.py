@@ -56,13 +56,15 @@ import urllib3
 
 import requests
 
-urllib3.disable_warnings()
+# Suppress InsecureRequestWarning only for local camera calls (self-signed certs).
+# Cloud API and Keycloak calls use verify=True and do not trigger this warning.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "9.0.4"
+VERSION     = "10.0.0"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -147,6 +149,7 @@ def save_config(cfg: dict) -> None:
     """Save config to file."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def _create_default_config() -> None:
@@ -562,7 +565,7 @@ def snap_from_proxy(cam_info: dict, token: str, hq: bool = False) -> bytes | Non
         print(f"  🌐  Opening {label} connection...")
         r = requests.put(
             f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
-            headers=headers, json={"type": conn_type, "highQualityVideo": hq}, verify=False, timeout=15,
+            headers=headers, json={"type": conn_type, "highQualityVideo": hq}, timeout=15,
         )
         if r.status_code != 200:
             return None
@@ -575,6 +578,7 @@ def snap_from_proxy(cam_info: dict, token: str, hq: bool = False) -> bytes | Non
             return None
         snap_url = scheme.replace("{url}", urls[0])
         snap_timeout = 5 if conn_type == "LOCAL" else 15
+        # snap.jpg may come from local camera (self-signed cert) — verify=False required
         if api_user and api_pass:
             from requests.auth import HTTPDigestAuth
             snap_r = requests.get(snap_url, auth=HTTPDigestAuth(api_user, api_pass),
@@ -589,7 +593,7 @@ def snap_from_proxy(cam_info: dict, token: str, hq: bool = False) -> bytes | Non
             # Retry once with a fresh connection
             r2 = requests.put(
                 f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
-                headers=headers, json={"type": conn_type, "highQualityVideo": hq}, verify=False, timeout=15,
+                headers=headers, json={"type": conn_type, "highQualityVideo": hq}, timeout=15,
             )
             if r2.status_code == 200:
                 data2     = r2.json()
@@ -2138,7 +2142,7 @@ def _send_signal_alert(
     if image_url and token:
         try:
             headers = {"Authorization": f"Bearer {token}", "Accept": "*/*"}
-            r = requests.get(image_url, headers=headers, verify=False, timeout=15)
+            r = requests.get(image_url, headers=headers, timeout=15)
             if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
                 b64 = _b64.b64encode(r.content).decode()
                 body["base64_attachments"] = [b64]
@@ -2233,7 +2237,7 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
 
                 if auto_snap and img_url:
                     try:
-                        r = sess.get(img_url, verify=False, timeout=15)
+                        r = sess.get(img_url, timeout=15)
                         if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
                             fname = f"event_{name}_{ts.replace(':', '-')}.jpg"
                             fpath = os.path.join(BASE_DIR, fname)
@@ -2287,7 +2291,7 @@ def _watch_fcm_push(cfg: dict, token: str, cams: dict, duration: int, auto_snap:
             f"{CLOUD_API}/v11/devices",
             headers=headers,
             json={"deviceType": device_type, "deviceToken": fcm_token},
-            verify=False, timeout=10,
+            timeout=10,
         )
         if r.status_code in (200, 201, 204):
             print(f"  ✅  Registered with Bosch CBS!")
@@ -2474,7 +2478,7 @@ def cmd_watch(cfg: dict, args) -> None:
                     # Auto-download and open the event snapshot if requested
                     if auto_snap and img_url:
                         try:
-                            r = session.get(img_url, verify=False, timeout=15)
+                            r = session.get(img_url, timeout=15)
                             if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
                                 fname = f"event_{name}_{ts.replace(':', '-').replace(' ', '_')}.jpg"
                                 fpath = os.path.join(BASE_DIR, fname)
@@ -2870,7 +2874,7 @@ def rcp_open_connection(cam_id: str, token: str) -> tuple[str, str]:
         f"{CLOUD_API}/v11/video_inputs/{cam_id}/connection",
         headers=headers,
         json={"type": "REMOTE", "highQualityVideo": False},
-        verify=False, timeout=15,
+        timeout=15,
     )
     if r.status_code != 200:
         raise RuntimeError(f"PUT /connection returned HTTP {r.status_code}")
@@ -2904,7 +2908,7 @@ def rcp_session(proxy_base: str) -> str:
         "payload": _RCP_HELLO_PAYLOAD,
     }
     r1 = requests.get(rcp_url, params=params_hello,
-                      auth=("", ""), verify=False, timeout=10)
+                      auth=("", ""), timeout=10)
     if r1.status_code != 200:
         raise RuntimeError(f"RCP HELLO returned HTTP {r1.status_code}")
 
@@ -2933,7 +2937,7 @@ def rcp_session(proxy_base: str) -> str:
         "payload": _RCP_HELLO_PAYLOAD,
     }
     r2 = requests.get(rcp_url, params=params_init,
-                      auth=("", ""), verify=False, timeout=10)
+                      auth=("", ""), timeout=10)
     if r2.status_code != 200:
         raise RuntimeError(f"RCP SESSION_INIT returned HTTP {r2.status_code}")
 
@@ -2982,7 +2986,7 @@ def rcp_read(rcp_url: str, command: str, sessionid: str,
     }
     try:
         r = requests.get(rcp_url, params=params,
-                         auth=("", ""), verify=False, timeout=10)
+                         auth=("", ""), timeout=10)
     except Exception as e:
         return None
 

@@ -70,6 +70,7 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 # ══════════════════════════ PKCE ══════════════════════════════════════════════
