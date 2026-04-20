@@ -2,7 +2,7 @@
 
 > **Reverse-engineered** Bosch Cloud API client for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innenkamera, Gen1+Gen2).
 > Live snapshots, live video stream (cloud + local LAN), privacy mode, light, notifications, pan control, intercom, camera sharing, automation rules, RCP protocol reads, and real-time event watching — all from the command line.
-> No official API. No app needed after setup. **v10.1.0**
+> No official API. No app needed after setup. **v10.1.1**
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
@@ -1621,6 +1621,7 @@ tool/
 
 | Version | Changes |
 |---------|---------|
+| **v10.1.1** | **Switch FCM push to official Bosch OSS Google API key.** Firebase/FCM registration now uses the official OSS key provided by Bosch instead of the app-embedded Firebase key from the APK. Bosch added the required Firebase Installations and FCM registration permissions on 2026-04-20 — confirmed working end-to-end. No user action required. |
 | **v10.1.0** | **Thread safety + TLS proxy reliability.** **(1) Pre-emptive token refresh.** New `_is_token_near_expiry(token_str, buffer_secs=60)` — stdlib-only JWT decode (no extra library). Called at the top of each watch-loop iteration and in the FCM callback; refreshes the token 60 s before expiry, preventing the single failed API call at the exact expiry moment. **(2) TLS proxy reconnect with exponential backoff.** The LOCAL RTSP TLS proxy thread retries on connection failure: 1 s → 2 s → 4 s. After 3 consecutive failures it exits cleanly with a clear stderr message instead of looping forever. Counter resets after 30 s of stable uptime. **(3) Connection pooling.** Singleton `requests.Session` with `HTTPAdapter(pool_connections=10, pool_maxsize=20)` — avoids TCP handshake overhead on repeated API calls. **(4) Graceful shutdown.** `threading.Event` SIGTERM/SIGINT handler; watch loop exits cleanly on signal. **(5) Retry with backoff.** `_request_with_retry`: 3 attempts, 1 s/2 s/4 s backoff on 5xx/Timeout/ConnectionError; 401 always passed through unchanged. |
 | **v10.0.0** | **Security hardening release (full pentest).** Based on a comprehensive penetration test. **(1)** `urllib3.disable_warnings()` scoped to `InsecureRequestWarning` only (was global suppression). **(2)** `bosch_config.json` file permissions set to `0600` (owner-only) on every save — was world-readable `0644`. |
 | **v9.0.4** | Version bump only. |
