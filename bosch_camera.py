@@ -68,7 +68,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "10.1.1"
+VERSION     = "10.1.2"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -154,12 +154,25 @@ def save_config(cfg: dict) -> None:
 
     Serialized via _CONFIG_LOCK so concurrent writes (main thread saving a fresh
     bearer token + FCM credentials-update callback firing from a background
-    thread) cannot interleave and produce a corrupt JSON file.
+    thread) cannot interleave. Written via tmpfile + os.replace so readers
+    never see a half-written JSON — process crash mid-write leaves the
+    previous file intact instead of a truncated one.
     """
     with _CONFIG_LOCK:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f, indent=2)
-        os.chmod(CONFIG_FILE, 0o600)
+        tmp_path = f"{CONFIG_FILE}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def _create_default_config() -> None:
