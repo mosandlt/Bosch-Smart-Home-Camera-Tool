@@ -68,7 +68,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bosch_config.json")
 CLOUD_API   = "https://residential.cbs.boschsecurity.com"
-VERSION     = "10.2.0"
+VERSION     = "10.2.1"
 
 DELAY = 0.5   # seconds between download requests (rate-limit protection)
 
@@ -1803,23 +1803,11 @@ def cmd_info(cfg: dict, args) -> None:
                     ip_str = rcp_parse_ip(d) if len(d) == 4 else rcp_parse_string(d)
                     print(f"      LAN IP:        {ip_str}  (via RCP)")
 
-                # Privacy mask cross-check (0x0d00 P_OCTET, 4 bytes, byte[1]==1 means ON)
-                # Bosch cloud /v11/video_inputs.privacyMode has been observed
-                # to misreport `OFF` for ONLINE cams in privacy (Gen2 Outdoor
-                # FW 9.40.25, 2026-04-27 — matches HA integration v10.4.8 fix).
-                # RCP reads camera hardware directly; flag any mismatch.
-                d = rcp_read(_rcp_url, "0x0d00", _rcp_sessionid)
-                if d and len(d) >= 2:
-                    rcp_priv_on = d[1] == 1
-                    cloud_priv_on = (priv == "ON") if priv in ("ON", "OFF") else None
-                    if cloud_priv_on is not None and cloud_priv_on != rcp_priv_on:
-                        print(
-                            f"      ⚠️  Privacy MISMATCH: cloud='{priv}', "
-                            f"hardware={'ON' if rcp_priv_on else 'OFF'} (via RCP) "
-                            f"— trust hardware; cloud can lag/lie"
-                        )
-                    else:
-                        print(f"      Privacy (RCP): {'ON' if rcp_priv_on else 'OFF'}  (matches cloud)")
+                # NOTE: privacy cross-check via 0x0d00 was added in v10.2.0
+                # and removed in v10.2.1. A/B testing proved 0x0d00 byte[1]
+                # stays 1 even with privacy-mode OFF — it's not the mode flag,
+                # so the cross-check produced a permanent false-positive.
+                # Cloud /v11/video_inputs.privacyMode is the correct source.
 
             except RuntimeError as _rcp_err:
                 print(f"      RCP:           unavailable ({_rcp_err})")
