@@ -3436,6 +3436,466 @@ def _get_fcm_api_key() -> str:
 FCM_CRED_KEY = "_fcm_credentials"  # key in bosch_config.json settings
 
 
+# ── firebase-messaging upstream bug fixes ────────────────────────────────────
+# The `firebase-messaging` PyPI library has three open, unmerged upstream bugs
+# that this tool hits in production against Bosch's cloud. Rather than vendor
+# the library we subclass it and replace exactly the three broken methods:
+#
+#   sdb9696/firebase-messaging#33 — `_listen()` logs a full traceback for the
+#       very first connectivity error of every reset, because `run_state` only
+#       becomes RESETTING *inside* `_reset()`, which runs *after* the log
+#       decision. On a WAN outage that is one traceback per ~63 s forever.
+#   sdb9696/firebase-messaging#37 — `_decrypt_raw_data()` decodes the webpush
+#       crypto-key/salt headers and our own stored keys with plain
+#       `urlsafe_b64decode`, which raises `binascii.Error` on the RFC 8291-legal
+#       *unpadded* base64 they are actually transmitted in — every push then
+#       fails to decrypt.
+#   sdb9696/firebase-messaging#42 + #44 — `_handle_data_message()` extracts the
+#       header values with a blind `header[3:]` / `header[5:]` slice, assuming
+#       they always start with exactly `"dh="` / `"salt="`. Real headers are
+#       multi-segment (`dh=<key>; p256ecdsa=<vapid>`) and case-insensitive, so
+#       the slice silently yields corrupted key bytes that still base64-decode
+#       but fail EC-point validation — raising a bare `ValueError("Invalid EC
+#       key.")` that escapes `_listen()`'s narrow handlers, hits its broad
+#       `except Exception`, and **terminates the whole push client**, silently
+#       ending the watch session.
+#
+# Each override is guarded independently against the upstream signature it
+# replicates: if a future library release changes one of them, only that fix
+# degrades back to the vanilla behaviour — the other two keep working.
+
+
+def _fcm_patch_note(msg: str) -> None:
+    """Report that one of the firebase-messaging fixes could not be applied.
+
+    Only ever fires when the installed library diverges from what the override
+    replicates (i.e. after a library upgrade), so it is worth surfacing rather
+    than swallowing — but it is never fatal, the vanilla behaviour still runs.
+    """
+    print(f"  [warn] FCM patch: {msg}", file=sys.stderr)
+
+
+def _urlsafe_b64decode_padded(data: str) -> bytes:
+    """Decode urlsafe base64 that may be missing its ``=`` padding.
+
+    Webpush keys and the crypto-key/salt headers (RFC 8291) are transmitted
+    without padding; Python's ``urlsafe_b64decode`` requires it and raises
+    ``binascii.Error`` on unpadded input (upstream #37).
+    """
+    import base64
+
+    return base64.urlsafe_b64decode(data.encode("ascii") + b"=" * (-len(data) % 4))
+
+
+def _decode_message_header(data: str) -> bytes:
+    """Decode a per-message crypto-key/salt header.
+
+    ``crypto-key``/``encryption`` are proto3 ``string`` fields, so their content
+    can legitimately contain non-ASCII bytes — but ``.encode("ascii")`` above
+    raises ``UnicodeEncodeError`` (a ``ValueError``, not a ``binascii.Error``)
+    for those, which would escape the skip-one-message handler and terminate the
+    whole client over a single bad message. Normalise to ``binascii.Error`` so
+    every header-decode failure is uniformly a single-message fault.
+    """
+    import binascii
+
+    try:
+        return _urlsafe_b64decode_padded(data)
+    except UnicodeEncodeError as ex:
+        raise binascii.Error(str(ex)) from ex
+
+
+def _decode_credential_material(data: str) -> bytes:
+    """Decode OUR OWN stored credential material (private/secret keys).
+
+    Same padding math as :func:`_decode_message_header`, but a failure here
+    means the stored credentials are corrupt — a client-wide fault that must
+    propagate rather than be silently skipped per message forever. Re-raised as
+    a plain ``ValueError`` to match what ``load_der_private_key`` already raises
+    for other forms of credential corruption.
+    """
+    import binascii
+
+    try:
+        return _urlsafe_b64decode_padded(data)
+    except (binascii.Error, UnicodeEncodeError) as ex:
+        raise ValueError(f"corrupt stored credential material: {ex}") from ex
+
+
+def _extract_crypto_header(raw: str, prefix: str) -> str:
+    """Extract a crypto-key/salt header value, tolerating real-world shapes.
+
+    Upstream (#42 + #44) does ``header[3:]``/``header[5:]``, assuming the wanted
+    parameter is the first ``;``-separated segment and matches case-exactly.
+    Neither holds: ``Crypto-Key``/``Encryption`` are ``;``-separated parameter
+    lists *and* (RFC 8188) ``,``-separated element lists, so a VAPID
+    ``p256ecdsa=`` or an ``rs=``/``keyid=`` parameter may legally precede
+    ``dh=``/``salt=``; and HTTP parameter names are case-insensitive.
+
+    Scans every segment across both separators for a case-insensitive prefix
+    match and strips surrounding whitespace (leftover whitespace would throw off
+    the padding math in :func:`_decode_message_header`). Falls back to the whole
+    stripped string unmodified if nothing matches — passing an unexpected shape
+    through rather than guessing.
+    """
+    for element in raw.split(","):
+        for segment in element.split(";"):
+            stripped = segment.strip()
+            if stripped.lower().startswith(prefix.lower()):
+                return stripped[len(prefix) :].strip()
+    return raw.strip()
+
+
+def _build_fcm_decrypt_override(
+    fcm_push_client_cls: type,
+) -> tuple[Optional[Any], tuple[type[Exception], ...]]:
+    """Build the upstream-#37 padded-decrypt override for ``_decrypt_raw_data``.
+
+    Returns ``(override_or_None, skip_exceptions)`` — the latter being the
+    exception types ``_listen()`` should treat as "skip just this one message".
+    ``skip_exceptions`` is built independently of whether the override itself
+    could be created: even vanilla ``_decrypt_raw_data`` reaches
+    ``http_ece.decrypt()`` and can raise ``ECEException`` whenever a message's
+    headers happen to already be a multiple of 4 in length.
+    """
+    import binascii
+    import inspect
+
+    skip_exceptions: tuple[type[Exception], ...] = (binascii.Error,)
+    try:
+        from http_ece import ECEException
+    except ImportError:
+        _fcm_patch_note("http_ece unavailable — unpadded-base64 decrypt fix not applied")
+        return None, skip_exceptions
+    skip_exceptions = (binascii.Error, ECEException)
+
+    try:
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import load_der_private_key
+        from http_ece import decrypt as http_ece_decrypt
+    except ImportError:
+        _fcm_patch_note("cryptography unavailable — unpadded-base64 decrypt fix not applied")
+        return None, skip_exceptions
+
+    decrypt_method = getattr(fcm_push_client_cls, "_decrypt_raw_data", None)
+    if decrypt_method is None or list(inspect.signature(decrypt_method).parameters) != [
+        "credentials",
+        "crypto_key_str",
+        "salt_str",
+        "raw_data",
+    ]:
+        _fcm_patch_note(
+            "upstream _decrypt_raw_data() signature changed — "
+            "unpadded-base64 decrypt fix not applied"
+        )
+        return None, skip_exceptions
+
+    def _decrypt_raw_data(
+        credentials: dict[str, dict[str, str]],
+        crypto_key_str: str,
+        salt_str: str,
+        raw_data: bytes,
+    ) -> bytes:
+        """Decrypt an FCM data message, tolerating unpadded base64 (#37)."""
+        crypto_key = _decode_message_header(crypto_key_str)
+        salt = _decode_message_header(salt_str)
+        der_data = _decode_credential_material(credentials["keys"]["private"])
+        secret = _decode_credential_material(credentials["keys"]["secret"])
+        # A failure here means OUR stored credentials are corrupt — a
+        # client-wide fault, deliberately left unguarded so it propagates.
+        privkey = load_der_private_key(der_data, password=None, backend=default_backend())
+        # http_ece.decrypt()'s own EC-point parsing of THIS message's crypto-key
+        # bytes is not wrapped into ECEException the way its AEAD path is: it
+        # raises a bare ValueError("Invalid EC key.") straight out of
+        # `cryptography`, which would tear down the whole client over one bad
+        # message. Pre-parse the point ourselves and convert ONLY that failure —
+        # deliberately not a broad try/except around decrypt(), which would also
+        # mask ValueErrors caused by our own stored private key.
+        try:
+            crypto_key_point = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), crypto_key
+            )
+        except ValueError as ex:
+            raise ECEException(str(ex)) from ex
+
+        decrypted: bytes = http_ece_decrypt(
+            raw_data,
+            salt=salt,
+            private_key=privkey,
+            dh=crypto_key_point,
+            version="aesgcm",
+            auth_secret=secret,
+        )
+        return decrypted
+
+    return _decrypt_raw_data, skip_exceptions
+
+
+def _build_fcm_handle_data_message_override(
+    fcm_push_client_cls: type,
+) -> Optional[Any]:
+    """Build the corrected ``_handle_data_message()`` override (#42 + #44).
+
+    The body is identical to the installed library version except the
+    ``crypto_key``/``salt`` extraction lines, which use
+    :func:`_extract_crypto_header` instead of upstream's blind slice.
+
+    The replicated body calls six *other* private upstream methods that a future
+    release could rename independently of ``_handle_data_message`` itself, so the
+    guard checks all of them — otherwise an upstream change elsewhere would
+    silently attach a body that ``AttributeError``s at runtime, reintroducing the
+    very crash class this fixes. An upstream handler that became a coroutine is
+    also rejected: this replica is deliberately sync (as every 0.4.x release is).
+    """
+    import inspect
+
+    handler = getattr(fcm_push_client_cls, "_handle_data_message", None)
+    required_helpers = (
+        "_app_data_by_key",
+        "_log_warn_with_limit",
+        "_log_verbose",
+        "_reset_error_count",
+        "_try_increment_error_count",
+        "_decrypt_raw_data",
+    )
+    if (
+        handler is None
+        or inspect.iscoroutinefunction(handler)
+        or list(inspect.signature(handler).parameters) != ["self", "msg"]
+        or not all(callable(getattr(fcm_push_client_cls, name, None)) for name in required_helpers)
+    ):
+        _fcm_patch_note(
+            "upstream _handle_data_message() changed — crypto-key/salt header fix not applied"
+        )
+        return None
+
+    try:
+        from firebase_messaging.fcmpushclient import ErrorType as _ErrorType
+    except ImportError:
+        _fcm_patch_note(
+            "firebase_messaging.ErrorType unavailable — crypto-key/salt header fix not applied"
+        )
+        return None
+
+    def _handle_data_message(self: Any, msg: Any) -> None:
+        if self._app_data_by_key(msg, "message_type", do_not_raise=True) == "deleted_messages":
+            # The deleted_messages message does not contain data.
+            return
+        crypto_key = _extract_crypto_header(self._app_data_by_key(msg, "crypto-key"), "dh=")
+        salt = _extract_crypto_header(self._app_data_by_key(msg, "encryption"), "salt=")
+        subtype = self._app_data_by_key(msg, "subtype")
+        if subtype != self.credentials["gcm"]["app_id"]:
+            self._log_warn_with_limit(
+                "Subtype %s in data message does not match"
+                + "app id client was registered with %s",
+                subtype,
+                self.credentials["gcm"]["app_id"],
+            )
+        decrypted = self._decrypt_raw_data(self.credentials, crypto_key, salt, msg.raw_data)
+        decrypted_json = None
+        try:
+            decrypted_json = json.loads(decrypted.decode("utf-8"))
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+            decrypted_json = None
+
+        if not decrypted_json:
+            self._log_warn_with_limit("Failed to decrypt data for message %s", msg.persistent_id)
+
+        ret_val = decrypted_json if decrypted_json else decrypted
+        self._log_verbose("Data for message %s is: %s", msg.persistent_id, ret_val)
+        try:
+            if not isinstance(ret_val, dict):
+                ret_val = {"message": ret_val}
+            self.callback(ret_val, msg.persistent_id, self.callback_context)
+            self._reset_error_count(_ErrorType.NOTIFY)
+        except Exception as ex:
+            print(f"  [warn] FCM notification callback raised: {ex}", file=sys.stderr)
+            self._try_increment_error_count(_ErrorType.NOTIFY)
+
+    return _handle_data_message
+
+
+def _patch_fcm_push_client_class() -> Optional[type]:
+    """Return a patched ``FcmPushClient`` subclass, or ``None`` if the installed
+    library is too new/old for safe subclassing (``_listen`` signature changed).
+    """
+    try:
+        from firebase_messaging import FcmPushClient, FcmPushClientRunState
+    except ImportError:
+        return None
+
+    import asyncio
+    import inspect
+    import ssl
+
+    listen_method = getattr(FcmPushClient, "_listen", None)
+    if listen_method is None or list(inspect.signature(listen_method).parameters) != ["self"]:
+        _fcm_patch_note("upstream _listen() signature changed — noise/crash fixes not applied")
+        return None
+
+    decrypt_override, skip_exceptions = _build_fcm_decrypt_override(FcmPushClient)
+    handle_data_message_override = _build_fcm_handle_data_message_override(FcmPushClient)
+
+    # run_state / do_listen / persistent_ids live on the (untyped, external)
+    # FcmPushClient base class, which neither pylint nor mypy can introspect.
+    class _Patched(FcmPushClient):  # type: ignore[misc]  # pylint: disable=too-few-public-methods,access-member-before-definition,attribute-defined-outside-init
+        """FcmPushClient with the upstream #33/#37/#42/#44 fixes applied."""
+
+        async def _listen(self) -> None:
+            """Upstream ``_listen()`` plus the #33 state fix and per-message
+            skip handlers, so one undecryptable push can no longer terminate
+            the whole client."""
+            if not await self._connect_with_retry():
+                return
+
+            try:
+                await self._login()
+
+                while self.do_listen:
+                    try:
+                        if self.run_state == FcmPushClientRunState.RESETTING:  # type: ignore[has-type]  # untyped external base class attr  # pylint: disable=access-member-before-definition
+                            await asyncio.sleep(1)
+                        elif msg := await self._receive_msg():
+
+                            async def _skip_and_ack(exc: Exception) -> None:
+                                persistent_id = getattr(msg, "persistent_id", None)
+                                print(
+                                    "  [warn] Skipping undecryptable FCM push message "
+                                    f"(id={persistent_id}): {exc}",
+                                    file=sys.stderr,
+                                )
+                                # Ack it anyway: upstream only appends to
+                                # persistent_ids / sends the selective ack AFTER
+                                # _handle_data_message() returns, so without this
+                                # Google MCS redelivers the same poisoned message
+                                # on every reconnect, forever.
+                                if persistent_id:
+                                    self.persistent_ids.append(persistent_id)
+                                    if self.config.send_selective_acknowledgements:
+                                        await self._send_selective_ack(persistent_id)
+
+                            try:
+                                await self._handle_message(msg)
+                            except skip_exceptions as decode_ex:
+                                # binascii.Error / ECEException are single-message
+                                # faults (bad padding, truncated body, tag mismatch
+                                # on a message meant for another subtype). Kept
+                                # narrower than ValueError on purpose: a plain
+                                # ValueError means our *stored* credentials are
+                                # corrupt, which must stay a client-wide fault.
+                                await _skip_and_ack(decode_ex)
+                            except RuntimeError as app_data_ex:
+                                # Upstream's _handle_data_message() unconditionally
+                                # looks up the crypto-key/encryption app_data
+                                # entries and raises a bare RuntimeError when
+                                # either is absent — e.g. a non-webpush control
+                                # message, or (RFC 8291) an aes128gcm-encoded one
+                                # that carries no such headers at all. Match only
+                                # that specific message shape.
+                                if "couldn't find in app_data" not in str(app_data_ex):
+                                    raise
+                                await _skip_and_ack(app_data_ex)
+
+                    except (OSError, EOFError) as osex:
+                        # FIX for upstream #33: advance to RESETTING here, before
+                        # the quiet-path check below — the library only sets it
+                        # inside _reset(), which runs afterwards, so the first OS
+                        # error always took the loud traceback branch.
+                        if self.run_state not in (  # type: ignore[has-type]  # untyped external base class attr  # pylint: disable=access-member-before-definition
+                            FcmPushClientRunState.RESETTING,
+                            FcmPushClientRunState.STOPPING,
+                            FcmPushClientRunState.STOPPED,
+                        ):
+                            self.run_state = (  # pylint: disable=attribute-defined-outside-init
+                                FcmPushClientRunState.RESETTING
+                            )
+
+                        quiet_reset = (
+                            isinstance(
+                                osex,
+                                (
+                                    ConnectionResetError,
+                                    TimeoutError,
+                                    asyncio.IncompleteReadError,
+                                    ssl.SSLError,
+                                ),
+                            )
+                            and self.run_state == FcmPushClientRunState.RESETTING
+                        )
+                        if quiet_reset:
+                            if (
+                                isinstance(osex, ssl.SSLError)
+                                and osex.reason != "APPLICATION_DATA_AFTER_CLOSE_NOTIFY"
+                            ):
+                                self._log_warn_with_limit(
+                                    "Unexpected SSLError reason during reset of %s",
+                                    osex.reason,
+                                )
+                            else:
+                                self._log_verbose(
+                                    "Expected read error during reset: %s",
+                                    type(osex).__name__,
+                                )
+                        else:
+                            print(
+                                f"  [warn] FCM read error: {osex!r}",
+                                file=sys.stderr,
+                            )
+
+                        # Upstream's own quiet branch never calls _reset() —
+                        # harmless there because run_state only becomes RESETTING
+                        # inside _reset() itself. Our pre-emptive flag above makes
+                        # the quiet branch reachable on the FIRST error of every
+                        # blip, so without resetting here _listen() would just spin
+                        # on `if run_state == RESETTING: sleep(1)` forever instead
+                        # of reconnecting. _reset() is idempotent.
+                        try:
+                            from firebase_messaging.fcmpushclient import (
+                                ErrorType as _ErrorType,
+                            )
+
+                            if self._try_increment_error_count(_ErrorType.CONNECTION):
+                                await self._reset()
+                        except ImportError:
+                            await self._reset()
+            except Exception as ex:
+                print(f"  ❌  FCM client shutting down after unknown error: {ex}", file=sys.stderr)
+                self._terminate()
+            finally:
+                await self._do_writer_close()
+
+    if decrypt_override is not None:
+        _Patched._decrypt_raw_data = staticmethod(decrypt_override)
+    if handle_data_message_override is not None:
+        _Patched._handle_data_message = handle_data_message_override
+
+    return _Patched
+
+
+# False = not yet computed; None = library present but unpatchable.
+_FCM_PATCHED_CLASS: Any = False
+
+
+def _get_fcm_push_client_class() -> Optional[type]:
+    """Return the patched ``FcmPushClient`` subclass, falling back to the vanilla
+    class if it cannot be patched, or ``None`` if the library is not installed.
+
+    Cached after the first call — the patch is built at most once per process.
+    """
+    global _FCM_PATCHED_CLASS
+    if _FCM_PATCHED_CLASS is False:
+        _FCM_PATCHED_CLASS = _patch_fcm_push_client_class()
+    if _FCM_PATCHED_CLASS is None:
+        try:
+            from firebase_messaging import FcmPushClient
+
+            return cast(type, FcmPushClient)
+        except ImportError:
+            return None
+    return cast(type, _FCM_PATCHED_CLASS)
+
+
 def _effective_event_type(event: dict[str, Any]) -> str:
     """Return the effective event type for display and routing.
 
@@ -3678,7 +4138,13 @@ def _watch_fcm_push(
 
         saved_creds = cfg.get("settings", {}).get(FCM_CRED_KEY)
 
-        client = FcmPushClient(
+        # Patched subclass fixing three open upstream firebase-messaging bugs
+        # (#33 log noise, #37 unpadded base64, #42/#44 header extraction — the
+        # last of which crashes the whole client on a single bad message).
+        # Falls back to the vanilla class if the installed library diverges.
+        client_cls = _get_fcm_push_client_class() or FcmPushClient
+
+        client = client_cls(
             callback=on_notification,
             fcm_config=fcm_config,
             credentials=saved_creds,

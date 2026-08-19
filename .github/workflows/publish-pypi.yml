@@ -6,8 +6,58 @@ on:
       - "v*.*.*"
 
 jobs:
+  # GATE — block build/publish/release until the required CI workflows pass
+  # on this exact tagged commit. Polls the Actions API; a workflow that
+  # concludes in any non-success terminal state aborts the whole pipeline.
+  # Closes the gap that let v10.12.2 publish to PyPI with broken
+  # requires-python metadata while its own test matrix was still failing.
+  require_ci_green:
+    name: Require CI to pass on this commit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Poll required workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          REQUIRED: "test.yml codeql.yml secret-scan.yml"
+        run: |
+          deadline=$(( $(date +%s) + 2400 ))   # 40 min ceiling
+          while :; do
+            pending=""
+            for wf in $REQUIRED; do
+              out=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" \
+                --commit "$SHA" --limit 1 \
+                --json conclusion,status \
+                --jq '.[0] | (.conclusion // "none") + " " + (.status // "none")' \
+                2>/dev/null || true)
+              [ -z "$out" ] && out="none none"
+              concl=${out%% *}
+              echo "  $wf -> conclusion=$concl"
+              case "$concl" in
+                success) ;;
+                failure|cancelled|timed_out|startup_failure|action_required)
+                  echo "::error::$wf concluded '$concl' on $SHA — refusing to publish"
+                  exit 1 ;;
+                *) pending="$pending $wf" ;;
+              esac
+            done
+            if [ -z "$pending" ]; then
+              echo "All required CI workflows passed on $SHA."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for required CI:$pending"
+              exit 1
+            fi
+            echo "Waiting for:$pending"
+            sleep 25
+          done
+
   build:
     name: Build distribution
+    needs: require_ci_green
     runs-on: ubuntu-latest
 
     steps:

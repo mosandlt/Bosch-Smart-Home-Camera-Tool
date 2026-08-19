@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bosch-smart-home-camera-tool"
-version = "10.12.3"
+version = "10.12.4"
 description = "Standalone command-line tool for Bosch Smart Home cameras (snapshots, livestream proxy, events, light/privacy control)."
 readme = "README.md"
 license = { file = "LICENSE" }
