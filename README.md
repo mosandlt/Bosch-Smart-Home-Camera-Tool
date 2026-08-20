@@ -45,6 +45,7 @@ Standalone Python CLI for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innen
   - [WebRTC Streaming](#webrtc-streaming)
   - [Privacy Mode](#privacy-mode)
   - [Camera Light](#camera-light)
+  - [Lighting Tuning (Gen2)](#lighting-tuning-gen2)
   - [Push Notifications](#push-notifications)
   - [Pan](#pan-camera_360-only)
   - [Motion Detection](#motion-detection)
@@ -64,6 +65,7 @@ Standalone Python CLI for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innen
   - [Profile](#profile)
   - [Account](#account)
   - [Firmware Update](#firmware-update)
+  - [Reset (Reboot / Factory Reset)](#reset-reboot--factory-reset)
   - [Maintenance Status](#maintenance-status)
   - [RCP Protocol Reads](#rcp-protocol-reads)
   - [Diagnostics — MJPEG Snapshot, Scopes, RCP Version, Feature Flags](#diagnostics--mjpeg-snapshot-scopes-rcp-version-feature-flags)
@@ -71,6 +73,7 @@ Standalone Python CLI for Bosch Smart Home cameras (Eyes Außenkamera, 360 Innen
   - [Token Management](#token-management)
   - [Config & Rescan](#config--rescan)
 - [Mini-NVR (BETA)](#nvr-beta)
+- [Frigate Endpoint (BETA)](#frigate-endpoint-beta)
 - [How It Works](#how-it-works)
 - [Cloud API Reference](#cloud-api-reference)
 - [RCP Protocol — Low-Level Camera Reads](#rcp-protocol--low-level-camera-reads)
@@ -368,6 +371,7 @@ flowchart LR
 | Silent token renewal / token fix | `token [fix\|browser]` |
 | **Mini-NVR: motion-triggered MP4 recording (BETA)** | `watch [cam] --auto-record` |
 | **NVR status / list / prune / upload (BETA)** | `nvr <status\|list\|prune\|upload> [cam]` |
+| **Always-on credential-free RTSP front-door for Frigate/BlueIris/go2rtc (BETA)** | `frigate-endpoint start [cam] [--port N] [--auth-mode ...]` |
 
 ---
 
@@ -463,6 +467,23 @@ python3 bosch_camera.py light Outdoor            # show light state (one camera)
 python3 bosch_camera.py light Outdoor on         # turn camera light on
 python3 bosch_camera.py light Outdoor off        # turn camera light off
 ```
+
+### Lighting Tuning (Gen2)
+
+```bash
+python3 bosch_camera.py lighting Outdoor                              # show all current values
+python3 bosch_camera.py lighting Outdoor --white-balance 0.5          # front light color temp, -1.0..1.0
+python3 bosch_camera.py lighting Outdoor --lens-elevation 2.5         # camera mount height, 0.5..5.0 m
+python3 bosch_camera.py lighting Outdoor --darkness-threshold 40      # day/night switch point, 0-100%
+python3 bosch_camera.py lighting Outdoor --soft-light-fading on       # smooth on/off fading
+python3 bosch_camera.py lighting Outdoor --top-led-brightness 75      # top LED, 0-100%
+python3 bosch_camera.py lighting Outdoor --bottom-led-brightness 25   # bottom LED, 0-100%
+python3 bosch_camera.py lighting Indoor  --power-led-brightness 2     # power LED, 0-4 (Indoor II)
+python3 bosch_camera.py lighting Outdoor --motion-light-sensitivity 4 # 1 (low)..5 (high)
+python3 bosch_camera.py lighting Outdoor --status-led off             # status/recording-indicator LED
+```
+
+Multiple flags may be combined in one call — each targets its own Gen2 lighting endpoint (`lighting/switch`, `lens_elevation`, `lighting`, `lighting/motion`, `iconLedBrightness`, `ledlights`). Unsupported fields on a given model return HTTP 442.
 
 ### Push Notifications
 
@@ -657,6 +678,16 @@ python3 bosch_camera.py firmware-update install --yes        # install on ALL ca
 
 Installing reboots the camera for 3–7 minutes. Targeting every camera at once (no camera name given to `install`) prompts for confirmation unless `--yes` is passed, since each camera reboots independently. Uses the same cloud endpoint as the official app's "Update now" button.
 
+### Reset (Reboot / Factory Reset)
+
+```bash
+python3 bosch_camera.py reset Outdoor --soft                  # reboot the camera
+python3 bosch_camera.py reset Outdoor --hard --confirm        # factory reset (DESTRUCTIVE, skips the prompt)
+python3 bosch_camera.py reset Outdoor --hard                  # factory reset — prompts "Type 'yes' to continue"
+```
+
+`--soft` reboots the camera (non-destructive, no re-pairing needed). `--hard` factory-resets it — the camera loses its Bosch account pairing and must be re-commissioned from scratch via the Bosch app; it always requires `--confirm` or an interactive `yes` before it fires. Uses `PUT /v11/video_inputs/{id}/soft_reset` / `/hard_reset`, the same endpoints as the app's Restart / Factory Reset actions. Note: cross-ported from the HA integration, where a live test against a real camera got HTTP 404 `sh:entity.notfound` for soft reset despite matching the app's request byte-for-byte — the endpoint may not be enabled server-side for every account/camera/firmware yet.
+
 ### Maintenance Status
 
 ```bash
@@ -740,9 +771,12 @@ python3 bosch_camera.py token browser            # force new browser login
 ### Config & Rescan
 
 ```bash
-python3 bosch_camera.py config                   # show current config
-python3 bosch_camera.py rescan                   # re-discover cameras
+python3 bosch_camera.py config                                # show current config
+python3 bosch_camera.py config set-quality Outdoor high        # persist a per-camera video-quality default
+python3 bosch_camera.py rescan                                 # re-discover cameras
 ```
+
+`config set-quality <camera> auto|high|low` stores a per-camera video-quality preference in `bosch_config.json`. `snapshot`/`live`/`stream`/`watch` read it automatically whenever `--quality` is omitted on that invocation — an explicit `--quality`/`--hq` flag on the command line always overrides the stored preference.
 
 ---
 
@@ -820,6 +854,55 @@ python3 bosch_camera.py nvr upload Garten
 - Motion-triggered only — there is no always-on background recording daemon (unlike the HA integration's "continuous" NVR mode). A short pre-trigger buffer (a few seconds of video from *before* the motion rising edge) is not implemented in this iteration; it would need a second, continuously-running ring-buffer ffmpeg process for the whole `watch --auto-record` session plus a concat-splice step, which is a larger architectural addition left for a future change.
 - SMB upload is synchronous and happens in the watch loop — large clips may add latency on slow NAS links.
 - No H.265 transcoding — stream is remuxed as-is; clip codec depends on camera firmware.
+
+---
+
+## Frigate Endpoint (BETA)
+
+> **BETA — test before use in production.**
+
+A normal LOCAL stream URL (`live`/`test-local`) carries inline Digest credentials that rotate roughly hourly on Gen2 firmware, and only exists while something asks for it. An external recorder (Frigate, BlueIris, go2rtc) polling on its own schedule gets "Connection refused" or a stale-credential 401 whenever nothing else happens to have a session open.
+
+`frigate-endpoint start` opens one always-listening TCP socket per camera at a stable port. On the first client connection it opens a Bosch LOCAL session (the same `PUT /v11/video_inputs/{id}/connection` call `test-local` makes) and performs the RTSP Digest-auth dance itself, so the recorder gets a fully **credential-free** `rtsp://127.0.0.1:<port>/...` URL instead. Runs in the foreground until Ctrl+C.
+
+### Quick Start
+
+```bash
+# Start front-doors for every configured camera (base port 8554, sorted by name)
+python3 bosch_camera.py frigate-endpoint start
+
+# Just one camera, custom base port
+python3 bosch_camera.py frigate-endpoint start Garten --port 9000
+
+# Bind on the LAN (not just localhost) + restrict by client IP
+python3 bosch_camera.py frigate-endpoint start --bind-host 0.0.0.0 --ip-allowlist 192.168.1.0/24
+
+# Add a shared-secret gate on top of the IP allowlist
+python3 bosch_camera.py frigate-endpoint start --auth-mode path_token --token mysecret
+```
+
+Point Frigate/BlueIris/go2rtc at the printed `rtsp://...` URL(s) — no credentials to configure or rotate.
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bind-host HOST` | `127.0.0.1` | Interface to bind (`0.0.0.0` for all interfaces) |
+| `--port N` | `8554` | Base port; camera N (sorted by name) binds to `N`+index |
+| `--ip-allowlist CIDR,...` | *(empty = allow all)* | Comma-separated IPs/CIDRs allowed to connect |
+| `--auth-mode none\|path_token\|basic` | `none` | Optional gate on top of the IP allowlist |
+| `--token SECRET` | *(empty)* | Shared secret for `--auth-mode path_token`/`basic` |
+| `--basic-user USER` | `frigate` | Username for `--auth-mode basic` |
+| `--idle-timeout SEC` | `60` | Zero-client linger before logging idle (`0` = immediate) |
+
+### How It's Different From the HA Integration
+
+The HA integration's front-door relays through a second, TLS-terminating inner proxy because HA always dials the camera over TLS for LOCAL sessions. This CLI's LOCAL sessions use plain `rtsp://` (see `test-local`), so there's no TLS hop to reproduce — the front-door here relays directly to the camera's `host:port`, one hop instead of two.
+
+### BETA Limitations
+
+- Each client connection re-opens the Bosch LOCAL session (`PUT /connection`) — cheap and idempotent on Bosch's side, but there's no persistent session cache across connections like the HA integration's coordinator. The `--idle-timeout` linger only logs; the Bosch-side session simply expires server-side once nothing renews it.
+- Foreground-only — no daemon/systemd-unit packaging in this iteration.
 
 ---
 
@@ -1749,7 +1832,8 @@ python3 start_proxy.py --dump   # same, but saves all flows to captures/ folder
 
 ```
 tool/
-  bosch_camera.py      — main CLI tool (all commands + interactive menu)
+  bosch_camera.py            — main CLI tool (all commands + interactive menu)
+  bosch_frigate_endpoint.py  — always-on credential-free RTSP front-door (frigate-endpoint command)
   get_token.py         — OAuth2 PKCE token manager (browser login + renewal)
   bosch_config.json    — auto-created config (credentials + camera list)
   README.md            — this file
@@ -1775,7 +1859,7 @@ The Bosch Smart Home Camera reverse-engineered API is exposed via four sibling p
 | Feature | [Home Assistant Integration](https://github.com/mosandlt/Bosch-Smart-Home-Camera-Tool-HomeAssistant) | [Python CLI Tool](https://github.com/mosandlt/Bosch-Smart-Home-Camera-Tool-Python) | [ioBroker Adapter](https://github.com/mosandlt/ioBroker.bosch-smart-home-camera) | [MCP Server](https://github.com/mosandlt/Bosch-Smart-Home-Camera-Tool-MCP) | [Frontend (NiceGUI)](https://github.com/mosandlt/Bosch-Smart-Home-Camera-Tool-Python-frontend) | [Node-RED](https://github.com/mosandlt/Bosch-Smart-Home-Camera-Tool-NodeRED) |
 |---|---|---|---|---|---|---|
 | **Maturity** | v15.0+ — HA Quality Scale **Platinum** | v10.12+ stable (Mini-NVR BETA) | v1.8+ stable · npm | v1.7+ stable · PyPI | v0.4.0 **alpha** · PyPI | v0.4.0 **alpha** · npm |
-| **Platform** | Home Assistant (HACS) | Standalone Python 3.11+ CLI | ioBroker (npm) | Python 3.10+ · pipx / uvx · stdio + streamable-HTTP for MCP clients (Claude Desktop, Claude Code, custom) | NiceGUI web app · Python 3.10+ | Node-RED palette · npm |
+| **Platform** | Home Assistant (HACS) | Standalone Python 3.10+ CLI | ioBroker (npm) | Python 3.10+ · pipx / uvx · stdio + streamable-HTTP for MCP clients (Claude Desktop, Claude Code, custom) | NiceGUI web app · Python 3.10+ | Node-RED palette · npm |
 | **Login** | OAuth2 PKCE (browser) | OAuth2 PKCE (browser) | OAuth2 PKCE (browser) | ◑ shares CLI `bosch_config.json` | ◑ shares CLI `bosch_config.json` | ◑ refresh-token from CLI |
 | **Snapshots** | ✅ Native `Camera.image` | ✅ `snapshot` command | ✅ File-store + base64 DP | ✅ `bosch_camera_snapshot` (LAN-only) | ✅ live + event fallback | ✅ `snapshot` node |
 | **Live RTSP stream (LAN)** | ✅ via HA Stream component | ✅ ffmpeg/RTSPS output | ✅ TLS proxy → local RTSP | ✅ `bosch_camera_stream_url` (LAN-only, no cloud relay) | ◑ internal (go2rtc) | ◑ `stream-url` node (URL only) |

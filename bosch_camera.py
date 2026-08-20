@@ -81,6 +81,7 @@ from typing import Any, Optional, cast
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import bosch_rcp_client  # RCP session/read/LOCAL-write via bosch-shc-camera-client
+import bosch_frigate_endpoint  # always-on credential-free RTSP front-door for recorders
 from bosch_i18n import t, set_lang, detect_lang
 from bosch_maintenance import MaintenanceWindow, fetch_maintenance
 from bosch_tls import bosch_get  # TOFU fingerprint pinning for LAN cameras
@@ -1216,15 +1217,22 @@ def cmd_snapshot(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     get_cameras(cfg, session)
     cams = resolve_cam(cfg, getattr(args, "cam", None))
     live = getattr(args, "live", False)
-    quality = getattr(args, "quality", None)
-    if quality == "high":
-        hq = True
-    elif quality is not None:
-        hq = False
-    else:
-        hq = getattr(args, "hq", False)
 
     for name, cam_info in cams.items():
+        # Explicit --quality wins; an explicit --hq on this invocation wins
+        # over a persisted preference too (bug-hunt fix — a stored
+        # `set-quality` default must never silently override an explicit
+        # flag on the same command); only with neither given does the
+        # persisted per-camera preference (`bosch config set-quality`) apply.
+        explicit_hq = getattr(args, "hq", False)
+        quality = _resolve_quality(args, cfg, name, other_explicit=explicit_hq)
+        if quality == "high":
+            hq = True
+        elif quality is not None:
+            hq = False
+        else:
+            hq = explicit_hq
+
         mode_str = "Live Snapshot" if live else "Latest Event Snapshot"
         print(t("cmd.snapshot.header", mode=mode_str, name=name))
 
@@ -2042,22 +2050,30 @@ def cmd_live(cfg: dict[str, Any], args: argparse.Namespace) -> None:
 
     use_sub: bool = getattr(args, "sub", False)
 
-    # Quality preset overrides --hq/--inst.  --sub maps to the inst=2 sub-stream.
-    quality = getattr(args, "quality", None)
-    if use_sub:
-        hq = False
-        inst = 2  # sub-stream is always inst=2
-    elif quality == "high":
-        hq = True
-        inst = getattr(args, "inst", 2) if getattr(args, "inst", 2) != 2 else 1
-    elif quality == "low":
-        hq = False
-        inst = getattr(args, "inst", 2) if getattr(args, "inst", 2) != 2 else 4
-    else:
-        hq = getattr(args, "hq", False)
-        inst = getattr(args, "inst", 2)
-
     for name, cam_info in cams.items():
+        # Precedence: explicit --quality always wins. Otherwise, an explicit
+        # --hq/--inst/--sub on THIS invocation wins over any persisted
+        # preference too (bug-hunt fix — a stored `set-quality` default must
+        # never silently override an explicit flag on the same command).
+        # Only when nothing was explicitly passed does the persisted
+        # per-camera preference (`bosch config set-quality`) apply.
+        explicit_hq = getattr(args, "hq", False)
+        explicit_inst = getattr(args, "inst", None)
+        other_explicit = explicit_hq or explicit_inst is not None or use_sub
+        quality = _resolve_quality(args, cfg, name, other_explicit=other_explicit)
+        if use_sub:
+            hq = False
+            inst = 2  # sub-stream is always inst=2
+        elif quality == "high":
+            hq = True
+            inst = explicit_inst if explicit_inst is not None and explicit_inst != 2 else 1
+        elif quality == "low":
+            hq = False
+            inst = explicit_inst if explicit_inst is not None and explicit_inst != 2 else 4
+        else:
+            hq = explicit_hq
+            inst = explicit_inst if explicit_inst is not None else 2
+
         print(f"\n── Live Stream: {name} ──────────────────────────────────────")
         if use_sub:
             print(f"  ℹ️   {t('cmd.live.using_sub_stream')}")
@@ -2200,8 +2216,77 @@ def cmd_live(cfg: dict[str, Any], args: argparse.Namespace) -> None:
                         break
 
 
+def get_quality_pref(cfg: dict[str, Any], cam_name: str) -> str:
+    """Return the persisted per-camera video-quality preference.
+
+    One of 'auto' (default when unset), 'high', or 'low'. Set via
+    `bosch config set-quality <cam> auto|high|low`. Family-parity with the
+    HA integration's BoschVideoQualitySelect / quality_prefs.get_quality
+    (session-only there; persisted to bosch_config.json here since the CLI
+    has no long-lived process to hold runtime state between invocations).
+    """
+    pref = cfg.get("settings", {}).get("quality_pref", {}).get(cam_name)
+    return str(pref) if pref in ("auto", "high", "low") else "auto"
+
+
+def set_quality_pref(cfg: dict[str, Any], cam_name: str, quality: str) -> None:
+    """Persist a per-camera video-quality preference into cfg['settings']['quality_pref']."""
+    cfg.setdefault("settings", {}).setdefault("quality_pref", {})[cam_name] = quality
+
+
+def _resolve_quality(
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    cam_name: str,
+    *,
+    other_explicit: bool = False,
+) -> Optional[str]:
+    """Return the effective --quality preset for one camera.
+
+    Precedence: an explicit `--quality` on the command line always wins.
+    Otherwise, if some OTHER quality-shaped flag was explicitly passed on
+    THIS invocation (`--hq`/`--inst`/`--sub` — pass ``other_explicit=True``
+    from the caller), that explicit flag must also win over any persisted
+    default — a stored `bosch config set-quality` preference must never
+    silently override an explicit flag on the same command (bug-hunt
+    finding). Only when nothing was explicitly passed at all does this fall
+    back to the persisted per-camera preference. If the camera has no stored
+    preference either, returns None — same as before this feature existed —
+    so callers' pre-existing --hq/--inst fallback logic is unaffected for
+    anyone who never touched `set-quality`.
+    """
+    explicit = getattr(args, "quality", None)
+    if explicit:
+        return str(explicit)
+    if other_explicit:
+        return None
+    stored = cfg.get("settings", {}).get("quality_pref", {}).get(cam_name)
+    return str(stored) if stored in ("auto", "high", "low") else None
+
+
 def cmd_config(cfg: dict[str, Any], args: argparse.Namespace) -> None:
-    """Show current config (mask all credentials for security)."""
+    """Show current config (mask all credentials for security), or manage settings.
+
+    Usage:
+      python3 bosch_camera.py config                              → show config
+      python3 bosch_camera.py config set-quality <cam> auto|high|low
+          → persist a per-camera video-quality default, read by
+            snapshot/live/stream/watch whenever --quality is omitted.
+    """
+    sub = getattr(args, "sub", None)
+    if sub and sub.lower() == "set-quality":
+        cam_arg = getattr(args, "cam", None)
+        quality = getattr(args, "quality", None)
+        if not cam_arg or quality not in ("auto", "high", "low"):
+            print("  ℹ️   Usage: bosch config set-quality <camera> auto|high|low")
+            return
+        cams = resolve_cam(cfg, cam_arg)
+        for name in cams:
+            set_quality_pref(cfg, name, quality)
+            print(f"  ✅  Quality preference for {name} set to '{quality}'.")
+        save_config(cfg)
+        return
+
     display = json.loads(json.dumps(cfg))  # deep copy
     # Mask every secret-shaped field, not just bearer/refresh — access_token,
     # firebase keys, FCM tokens, local camera passwords are all credentials.
@@ -3187,6 +3272,246 @@ def cmd_light(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         else:
             _hint_local_on_5xx(pr.status_code, f"bosch light {name.lower()} {action} --local")
             print(f"  ❌  Failed: HTTP {pr.status_code}  {pr.text[:200]}")
+
+
+# Full-body default for the "lighting/switch" endpoint's 3 light groups — the
+# API requires all 3 present on every write, matching the coordinator cache
+# defaults in the HA integration's number.py (_LIGHT_SW_DEFAULT).
+_LIGHTING_SWITCH_DEFAULT: dict[str, Any] = {
+    "brightness": 0,
+    "color": None,
+    "whiteBalance": 0.0,
+}
+
+
+def cmd_lighting(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Get or set Gen2 lighting/LED tuning parameters via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py lighting <cam>                       → show current values
+      python3 bosch_camera.py lighting <cam> --white-balance N     → front light color temp, -1.0..1.0
+      python3 bosch_camera.py lighting <cam> --lens-elevation N    → camera mount height, 0.5..5.0 m
+      python3 bosch_camera.py lighting <cam> --darkness-threshold N → day/night switch point, 0-100%
+      python3 bosch_camera.py lighting <cam> --soft-light-fading on|off
+      python3 bosch_camera.py lighting <cam> --top-led-brightness N    → 0-100%
+      python3 bosch_camera.py lighting <cam> --bottom-led-brightness N → 0-100%
+      python3 bosch_camera.py lighting <cam> --power-led-brightness N  → 0-4 (5 discrete steps)
+      python3 bosch_camera.py lighting <cam> --motion-light-sensitivity N → 1-5
+      python3 bosch_camera.py lighting <cam> --status-led on|off
+
+    Multiple flags may be combined in a single call — each targets its own
+    endpoint. Cross-ported from the HA integration's number.py/switch.py
+    (2026-08 family-parity work). Endpoint shapes (verified against HA's
+    actual GET/PUT request bodies, not guessed):
+
+      GET/PUT /v11/video_inputs/{id}/lighting/switch
+        {"frontLightSettings": {"brightness": int, "color": ..., "whiteBalance": float},
+         "topLedLightSettings": {...}, "bottomLedLightSettings": {...}}
+        (full body required on write — API rejects a partial body)
+      GET/PUT /v11/video_inputs/{id}/lens_elevation      {"elevation": float}
+      GET/PUT /v11/video_inputs/{id}/lighting            {"darknessThreshold": float 0-1, "softLightFading": bool}
+      GET/PUT /v11/video_inputs/{id}/lighting/motion     {..., "motionLightSensitivity": int 1-5} (full body)
+      GET/PUT /v11/video_inputs/{id}/iconLedBrightness   {"value": int 0-4}
+      GET/PUT /v11/video_inputs/{id}/ledlights           {"state": "ON"/"OFF"}
+
+    Gen2-only across the board; unsupported models return HTTP 442.
+    """
+    token = get_token(cfg)
+    session = make_session(token)
+    get_cameras(cfg, session)
+    cams = resolve_cam(cfg, getattr(args, "cam", None))
+
+    # Bug-hunt finding: no client-side range validation existed for these
+    # numeric flags — Bosch's API rejects (or silently ignores) out-of-range
+    # values with a confusing generic error. HA enforces the same ranges via
+    # its NumberEntity min/max definitions; validate up front here too so an
+    # invalid value fails clearly before any PUT is ever sent.
+    _lighting_ranges: dict[str, tuple[str, float, float]] = {
+        "white_balance": ("--white-balance", -1.0, 1.0),
+        "lens_elevation": ("--lens-elevation", 0.5, 5.0),
+        "darkness_threshold": ("--darkness-threshold", 0, 100),
+        "top_led_brightness": ("--top-led-brightness", 0, 100),
+        "bottom_led_brightness": ("--bottom-led-brightness", 0, 100),
+        "motion_light_sensitivity": ("--motion-light-sensitivity", 1, 5),
+    }
+    for _attr, (_flag, _lo, _hi) in _lighting_ranges.items():
+        _val = getattr(args, _attr, None)
+        if _val is not None and not _lo <= _val <= _hi:
+            print(f"  ❌  {_flag} must be between {_lo} and {_hi} (got {_val}).")
+            return
+
+    def _get(cam_id: str, endpoint: str) -> tuple[int, Any]:
+        r = session.get(f"{CLOUD_API}/v11/video_inputs/{cam_id}/{endpoint}", timeout=10)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return r.status_code, body
+
+    def _put(cam_id: str, endpoint: str, body: Any) -> int:
+        r = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/{endpoint}",
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return r.status_code
+
+    def _err(status: int) -> Optional[str]:
+        if status == 401:
+            return "Token expired."
+        if status == 444:
+            return "Camera offline."
+        if status == 442:
+            return "Not supported on this camera model."
+        if status not in (200, 201, 204):
+            return f"HTTP {status}"
+        return None
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── Lighting: {name} ────────────────────────────────────────")
+        any_action = False
+
+        wb = getattr(args, "white_balance", None)
+        top_b = getattr(args, "top_led_brightness", None)
+        bottom_b = getattr(args, "bottom_led_brightness", None)
+        if wb is not None or top_b is not None or bottom_b is not None:
+            any_action = True
+            status, cur = _get(cam_id, "lighting/switch")
+            err = _err(status)
+            if err:
+                print(f"  ❌  lighting/switch GET failed: {err}")
+            else:
+                cur = cur if isinstance(cur, dict) else {}
+                body = {
+                    k: dict(cur.get(k) or _LIGHTING_SWITCH_DEFAULT)
+                    for k in ("frontLightSettings", "topLedLightSettings", "bottomLedLightSettings")
+                }
+                if wb is not None:
+                    body["frontLightSettings"]["whiteBalance"] = round(wb, 2)
+                    body["frontLightSettings"]["color"] = None
+                if top_b is not None:
+                    body["topLedLightSettings"]["brightness"] = round(top_b)
+                if bottom_b is not None:
+                    body["bottomLedLightSettings"]["brightness"] = round(bottom_b)
+                pstatus = _put(cam_id, "lighting/switch", body)
+                perr = _err(pstatus)
+                if perr:
+                    print(f"  ❌  lighting/switch PUT failed: {perr}")
+                else:
+                    if wb is not None:
+                        print(f"  ✅  White balance set to {round(wb, 2)}")
+                    if top_b is not None:
+                        print(f"  ✅  Top LED brightness set to {round(top_b)}%")
+                    if bottom_b is not None:
+                        print(f"  ✅  Bottom LED brightness set to {round(bottom_b)}%")
+
+        elevation = getattr(args, "lens_elevation", None)
+        if elevation is not None:
+            any_action = True
+            pstatus = _put(cam_id, "lens_elevation", {"elevation": round(elevation, 2)})
+            perr = _err(pstatus)
+            if perr:
+                print(f"  ❌  Lens elevation PUT failed: {perr}")
+            else:
+                print(f"  ✅  Lens elevation set to {round(elevation, 2)}m")
+
+        threshold = getattr(args, "darkness_threshold", None)
+        soft_fading_arg = getattr(args, "soft_light_fading", None)
+        soft_fading = None if soft_fading_arg is None else soft_fading_arg == "on"
+        if threshold is not None or soft_fading is not None:
+            any_action = True
+            status, cur = _get(cam_id, "lighting")
+            err = _err(status)
+            if err:
+                print(f"  ❌  lighting GET failed: {err}")
+            else:
+                cur = cur if isinstance(cur, dict) else {}
+                body = {
+                    "darknessThreshold": (
+                        round(threshold / 100, 4)
+                        if threshold is not None
+                        else cur.get("darknessThreshold", 0.5)
+                    ),
+                    "softLightFading": (
+                        soft_fading if soft_fading is not None else cur.get("softLightFading", True)
+                    ),
+                }
+                pstatus = _put(cam_id, "lighting", body)
+                perr = _err(pstatus)
+                if perr:
+                    print(f"  ❌  lighting PUT failed: {perr}")
+                else:
+                    if threshold is not None:
+                        print(f"  ✅  Darkness threshold set to {threshold}%")
+                    if soft_fading is not None:
+                        print(f"  ✅  Soft light fading set to {'ON' if soft_fading else 'OFF'}")
+
+        sensitivity = getattr(args, "motion_light_sensitivity", None)
+        if sensitivity is not None:
+            any_action = True
+            status, cur = _get(cam_id, "lighting/motion")
+            err = _err(status)
+            if err:
+                print(f"  ❌  lighting/motion GET failed: {err}")
+            elif not isinstance(cur, dict) or not cur:
+                # This PUT is a full-object replace, not a partial patch — an
+                # empty/non-dict GET means we don't actually know the sibling
+                # lightOnMotionEnabled value, and sending a body without it
+                # would silently clobber it. Abort instead of guessing, same
+                # guard as the HA integration's number.py _motion_light_sensitivity_set.
+                print(
+                    "  ❌  lighting/motion GET returned no data — refusing to write "
+                    "(would clobber the sibling lightOnMotionEnabled field)."
+                )
+            else:
+                body = dict(cur)
+                body["motionLightSensitivity"] = round(sensitivity)
+                pstatus = _put(cam_id, "lighting/motion", body)
+                perr = _err(pstatus)
+                if perr:
+                    print(f"  ❌  lighting/motion PUT failed: {perr}")
+                else:
+                    print(f"  ✅  Motion light sensitivity set to {round(sensitivity)}")
+
+        power_led = getattr(args, "power_led_brightness", None)
+        if power_led is not None:
+            any_action = True
+            val = max(0, min(4, round(power_led)))
+            pstatus = _put(cam_id, "iconLedBrightness", {"value": val})
+            perr = _err(pstatus)
+            if perr:
+                print(f"  ❌  Power LED brightness PUT failed: {perr}")
+            else:
+                print(f"  ✅  Power LED brightness set to {val}")
+
+        status_led_arg = getattr(args, "status_led", None)
+        if status_led_arg is not None:
+            any_action = True
+            state = "ON" if status_led_arg == "on" else "OFF"
+            pstatus = _put(cam_id, "ledlights", {"state": state})
+            perr = _err(pstatus)
+            if perr:
+                print(f"  ❌  Status LED PUT failed: {perr}")
+            else:
+                print(f"  ✅  Status LED set to {state}")
+
+        if not any_action:
+            for label, endpoint in (
+                ("Lighting (front/top/bottom LEDs)", "lighting/switch"),
+                ("Lens elevation", "lens_elevation"),
+                ("Darkness threshold / soft fading", "lighting"),
+                ("Motion light sensitivity", "lighting/motion"),
+                ("Power LED brightness", "iconLedBrightness"),
+                ("Status LED", "ledlights"),
+            ):
+                status, cur = _get(cam_id, endpoint)
+                err = _err(status)
+                if err:
+                    print(f"  {label}: {err}")
+                else:
+                    print(f"  {label}: {json.dumps(cur)}")
 
 
 # Pan preset angles — canonical mapping used by CLI, MCP, and ioBroker.
@@ -4730,6 +5055,122 @@ def cmd_nvr(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     handlers[sub](cfg, args)
 
 
+def _cmd_frigate_start(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Start always-on, credential-free RTSP front-door(s) for external recorders.
+
+    Opens one always-listening TCP socket per camera at a stable port (base
+    port + sorted-camera-index). On the first client connection it opens a
+    Bosch LOCAL session (same PUT /v11/video_inputs/{id}/connection call
+    `test-local` makes) and performs the RTSP Digest-auth dance itself, so
+    Frigate/BlueIris/go2rtc get a fully credential-free
+    rtsp://127.0.0.1:<port>/... URL instead of one with rotating inline
+    Digest credentials. Runs in the foreground until Ctrl+C.
+
+    See bosch_frigate_endpoint.py for the full design + why this CLI's LOCAL
+    sessions (plain rtsp://, no TLS) need only a single relay hop, unlike the
+    HA integration's two-hop (front-door -> inner TLS proxy -> camera) design.
+    """
+    import asyncio
+
+    cams = resolve_cam(cfg, getattr(args, "cam", None))
+    if not cams:
+        print("  ❌  No cameras found.")
+        return
+
+    raw_allow = getattr(args, "ip_allowlist", "") or ""
+    allowlist = frozenset(p.strip() for p in raw_allow.split(",") if p.strip())
+    auth_mode = getattr(args, "auth_mode", "none") or "none"
+    if auth_mode not in (
+        bosch_frigate_endpoint.AUTH_NONE,
+        bosch_frigate_endpoint.AUTH_PATH_TOKEN,
+        bosch_frigate_endpoint.AUTH_BASIC,
+    ):
+        print(f"  ❌  Unknown --auth-mode {auth_mode!r} (expected: none | path_token | basic)")
+        return
+    token = getattr(args, "token", "") or ""
+    # Bug-hunt finding: an empty --token with --auth-mode basic/path_token used
+    # to only WARN and then start the listener unauthenticated anyway — the
+    # exact opposite of what was requested. Abort before starting the listener
+    # instead of silently falling back to an open front-door.
+    if auth_mode != bosch_frigate_endpoint.AUTH_NONE and not token:
+        print(
+            f"  ❌  --auth-mode {auth_mode} requires --token — refusing to start an "
+            "unauthenticated front-door when auth was explicitly requested."
+        )
+        return
+
+    config = bosch_frigate_endpoint.FrontDoorConfig(
+        bind_host=getattr(args, "bind_host", "127.0.0.1") or "127.0.0.1",
+        ip_allowlist=allowlist,
+        auth_mode=auth_mode,
+        token=token,
+        basic_user=getattr(args, "basic_user", "frigate") or "frigate",
+        idle_timeout=float(getattr(args, "idle_timeout", 60) or 0),
+        max_connections=8,
+    )
+    base_port = int(getattr(args, "port", 8554) or 8554)
+    url_host = bosch_frigate_endpoint.frigate_url_host(config.bind_host)
+
+    _install_stop_handlers()
+
+    async def _run() -> None:
+        runner = bosch_frigate_endpoint.FrontDoorRunner()
+        sorted_names = sorted(cams.keys())
+        try:
+            for idx, name in enumerate(sorted_names):
+                cam_id = cams[name]["id"]
+                resolve = bosch_frigate_endpoint.make_resolve_inner(cfg, cam_id)
+
+                def _make_on_idle(cam_id: str = cam_id) -> Any:
+                    def _on_idle() -> None:
+                        print(f"  💤  {cam_id[:8]}: idle — LOCAL session will lapse naturally")
+
+                    return _on_idle
+
+                try:
+                    port = await runner.start_server(
+                        cam_id,
+                        config,
+                        resolve,
+                        preferred_port=base_port + idx,
+                        on_idle=_make_on_idle(),
+                    )
+                except OSError as err:
+                    print(f"  ❌  {name}: could not bind port {base_port + idx} ({err})")
+                    continue
+                url = bosch_frigate_endpoint.build_public_url(url_host, port, config)
+                print(f"  ✅  {name}: {url}")
+
+            if not runner.has_any_server():
+                print("  ❌  No front-door could be started.")
+                return
+
+            print("\n  📡  Front-door(s) listening. Press Ctrl+C to stop.\n")
+            while not _STOP_REQUESTED.is_set():
+                await asyncio.sleep(1)
+        finally:
+            runner.stop_all()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+    print("\n  ⏹️   Frigate front-door(s) stopped.")
+
+
+def cmd_frigate_endpoint(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """BETA: always-on credential-free RTSP front-door sub-command dispatcher."""
+    sub = getattr(args, "frigate_sub", None)
+    handlers = {
+        "start": _cmd_frigate_start,
+    }
+    if sub not in handlers:
+        print("  ℹ️   frigate-endpoint — always-on, credential-free RTSP front-door(s)")
+        print("  Subcommands: start")
+        return
+    handlers[sub](cfg, args)
+
+
 def cmd_watch(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     """
     Watch for new camera events by polling GET /v11/events every N seconds.
@@ -5020,7 +5461,11 @@ def cmd_watch(cfg: dict[str, Any], args: argparse.Namespace) -> None:
                             snap_data: Optional[bytes] = None
                             try:
                                 snap_data = snap_from_proxy(
-                                    cam_info, token, hq=False, cfg=cfg, session=session
+                                    cam_info,
+                                    token,
+                                    hq=(get_quality_pref(cfg, name) == "high"),
+                                    cfg=cfg,
+                                    session=session,
                                 )
                             except Exception:
                                 pass
@@ -7976,6 +8421,107 @@ def cmd_firmware_update(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         print(f"  Installing now: {updating}")
 
 
+def cmd_reset(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Reboot (soft reset) or factory-reset (hard reset) a camera via the Bosch cloud API.
+
+    Usage:
+      python3 bosch_camera.py reset <cam> --soft   → reboot the camera
+      python3 bosch_camera.py reset <cam> --hard --confirm  → factory reset
+
+    API: PUT /v11/video_inputs/{id}/soft_reset (bodyless) — reboots the camera,
+         same effect as the "Restart" action in the official Bosch app.
+         PUT /v11/video_inputs/{id}/hard_reset (bodyless) — factory-resets the
+         camera; DESTRUCTIVE, loses Bosch account pairing, must be
+         re-commissioned from scratch via the Bosch app afterward.
+    Cross-ported from the HA integration's device_actions.async_soft_reset_camera /
+    async_hard_reset_camera (2026-08 family-parity work). NOTE: live-tested by
+    the HA integration against a real online camera — Bosch's cloud rejected the
+    soft-reset call with HTTP 404 sh:entity.notfound despite matching the
+    official app byte-for-byte, so the endpoint may not be enabled server-side
+    for every account/camera/firmware combination yet. Kept here regardless —
+    the request shape is correct and may simply start working once Bosch's
+    backend catches up.
+    """
+    token = get_token(cfg)
+    session = make_session(token)
+    get_cameras(cfg, session)
+    cam_arg = getattr(args, "cam", None)
+    soft = getattr(args, "soft", False)
+    hard = getattr(args, "hard", False)
+
+    if soft == hard:
+        print("  ℹ️   Specify exactly one of --soft or --hard.")
+        return
+
+    # Guard: no camera name given resolves to EVERY configured camera
+    # (resolve_cam(cfg, None) returns the full cameras dict) — the same bug
+    # class documented in CHANGELOG.md for firmware-update install (2026-07-11).
+    # --hard is destructive (factory reset, loses Bosch account pairing) and
+    # must NEVER silently fan out — reject outright instead of prompting.
+    # --soft just reboots, so a fleet-wide reboot is allowed but only via an
+    # explicit opt-in --all flag, never implicitly from a bare `reset --soft`.
+    if hard and not cam_arg:
+        print(
+            "  ❌  --hard requires an explicit camera name — refusing to factory-reset every camera."
+        )
+        return
+    if soft and not cam_arg and not getattr(args, "all", False):
+        print(
+            "  ❌  No camera given — pass a camera name, or --all to reboot every configured camera."
+        )
+        return
+
+    cams = resolve_cam(cfg, cam_arg)
+    endpoint = "soft_reset" if soft else "hard_reset"
+    label = "Soft reset (reboot)" if soft else "Hard reset (FACTORY RESET)"
+
+    if hard:
+        names = ", ".join(cams.keys())
+        print(f"\n⚠️   {label} DESTROYS the Bosch account pairing for: {names}")
+        print("    The camera(s) must be re-commissioned from scratch via the Bosch app.")
+        if not getattr(args, "confirm", False):
+            try:
+                reply = input("    Type 'yes' to continue: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reply = ""
+            if reply != "yes":
+                print("    Aborted.")
+                return
+
+    if soft and len(cams) > 1 and not getattr(args, "confirm", False):
+        names = ", ".join(cams.keys())
+        print(f"\n⚠️   {label} will reboot ALL {len(cams)} cameras: {names}")
+        try:
+            reply = input("    Continue for all cameras? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            reply = ""
+        if reply != "y":
+            print("    Aborted.")
+            return
+
+    for name, cam_info in cams.items():
+        cam_id = cam_info["id"]
+        print(f"\n── {label}: {name} ─────────────────────────────────────────")
+        r = session.put(
+            f"{CLOUD_API}/v11/video_inputs/{cam_id}/{endpoint}",
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code == 401:
+            print("  ❌  Token expired.")
+            return
+        if r.status_code == 444:
+            print("  ⚠️   Camera offline.")
+            continue
+        if r.status_code == 442:
+            print("  ⚠️   Not supported on this camera model.")
+            continue
+        if r.status_code in (200, 201, 204):
+            print(f"  ✅  {label} triggered.")
+        else:
+            print(f"  ❌  Failed: HTTP {r.status_code}  {r.text[:200]}")
+
+
 def cmd_rename(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     """Rename a camera via the Bosch cloud API.
 
@@ -8026,6 +8572,13 @@ def cmd_rename(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg["cameras"][new_name] = cam_info
         if old_name != new_name and old_name in cfg["cameras"]:
             del cfg["cameras"][old_name]
+        # Bug-hunt finding: quality_pref is keyed by camera NAME (not id), so
+        # a rename orphaned any persisted `bosch config set-quality`
+        # preference under the old, now-nonexistent name — migrate it too.
+        if old_name != new_name:
+            quality_prefs = cfg.get("settings", {}).get("quality_pref", {})
+            if old_name in quality_prefs:
+                quality_prefs[new_name] = quality_prefs.pop(old_name)
         save_config(cfg)
         print("  💾  Config updated.")
     elif r.status_code == 444:
@@ -8972,7 +9525,7 @@ def main() -> None:
     p_live.add_argument(
         "--inst",
         type=int,
-        default=2,
+        default=None,
         metavar="N",
         help="Stream instance number in RTSPS URL (default: 2)",
     )
@@ -9058,7 +9611,7 @@ def main() -> None:
     p_stream.add_argument(
         "--inst",
         type=int,
-        default=2,
+        default=None,
         metavar="N",
         help="Stream instance number in RTSPS URL (default: 2)",
     )
@@ -9271,6 +9824,101 @@ def main() -> None:
         help="Force LAN RCP write for front light (Gen2 only) — skip cloud",
     )
 
+    # ── lighting (Gen2 tuning surface) ──────────────────────────────────────────
+    p_lighting = subparsers.add_parser(
+        "lighting",
+        help="Get/set Gen2 lighting + LED tuning parameters (cloud API)",
+        description=(
+            "💡  lighting — Gen2 lighting/LED tuning surface\n"
+            "\n"
+            "  Default (no flags): show current values for every endpoint.\n"
+            "  Any combination of flags may be passed in one call.\n"
+            "\n"
+            "  GET/PUT /v11/video_inputs/{id}/lighting/switch    (white balance, top/bottom LED)\n"
+            "  GET/PUT /v11/video_inputs/{id}/lens_elevation\n"
+            "  GET/PUT /v11/video_inputs/{id}/lighting           (darkness threshold, soft fading)\n"
+            "  GET/PUT /v11/video_inputs/{id}/lighting/motion    (motion light sensitivity)\n"
+            "  GET/PUT /v11/video_inputs/{id}/iconLedBrightness  (power LED, Indoor II)\n"
+            "  GET/PUT /v11/video_inputs/{id}/ledlights          (status LED)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py lighting Garten\n"
+            "    python3 bosch_camera.py lighting Garten --white-balance 0.5\n"
+            "    python3 bosch_camera.py lighting Garten --lens-elevation 2.5\n"
+            "    python3 bosch_camera.py lighting Garten --darkness-threshold 40\n"
+            "    python3 bosch_camera.py lighting Garten --status-led off"
+        ),
+    )
+    p_lighting.add_argument(
+        "cam",
+        nargs="?",
+        metavar="<camera>",
+        help="Camera name or partial match (omit = all cameras)",
+    )
+    p_lighting.add_argument(
+        "--white-balance",
+        type=float,
+        metavar="N",
+        dest="white_balance",
+        help="Front light color temperature, -1.0 (cool) .. 1.0 (warm)",
+    )
+    p_lighting.add_argument(
+        "--lens-elevation",
+        type=float,
+        metavar="N",
+        dest="lens_elevation",
+        help="Camera mount height in meters, 0.5..5.0",
+    )
+    p_lighting.add_argument(
+        "--darkness-threshold",
+        type=float,
+        metavar="N",
+        dest="darkness_threshold",
+        help="Day/night switch point, 0-100%% (0=always day, 100=always night)",
+    )
+    p_lighting.add_argument(
+        "--soft-light-fading",
+        choices=["on", "off"],
+        dest="soft_light_fading",
+        help="Lights fade smoothly instead of snapping on/off",
+    )
+    p_lighting.add_argument(
+        "--top-led-brightness",
+        type=float,
+        metavar="N",
+        dest="top_led_brightness",
+        help="Top LED brightness, 0-100%%",
+    )
+    p_lighting.add_argument(
+        "--bottom-led-brightness",
+        type=float,
+        metavar="N",
+        dest="bottom_led_brightness",
+        help="Bottom LED brightness, 0-100%%",
+    )
+    p_lighting.add_argument(
+        "--power-led-brightness",
+        type=float,
+        metavar="N",
+        dest="power_led_brightness",
+        help="Power LED brightness, 0-4 (5 discrete steps, Indoor II)",
+    )
+    p_lighting.add_argument(
+        "--motion-light-sensitivity",
+        type=float,
+        metavar="N",
+        dest="motion_light_sensitivity",
+        help="Motion-triggered light sensitivity, 1 (low) .. 5 (high)",
+    )
+    p_lighting.add_argument(
+        "--status-led",
+        choices=["on", "off"],
+        dest="status_led",
+        help="Status/recording-indicator LED on or off",
+    )
+
     # ── notifications ──────────────────────────────────────────────────────────
     p_notif = subparsers.add_parser(
         "notifications",
@@ -9394,17 +10042,39 @@ def main() -> None:
     )
 
     # ── config ─────────────────────────────────────────────────────────────────
-    subparsers.add_parser(
+    p_config = subparsers.add_parser(
         "config",
-        help="Show current config file (tokens masked)",
+        help="Show current config file (tokens masked), or manage settings",
         description=(
             "⚙️   config — Show current config file\n"
             "\n"
             "  Prints bosch_config.json with tokens truncated for security.\n"
-            "  Also shows the current token expiry."
+            "  Also shows the current token expiry.\n"
+            "\n"
+            "  Subcommands:\n"
+            "    (none)                          → show config (default)\n"
+            "    set-quality <cam> auto|high|low → persist a per-camera video-\n"
+            "                                       quality default read by\n"
+            "                                       snapshot/live/stream/watch\n"
+            "                                       when --quality is omitted"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="  Example:\n    python3 bosch_camera.py config",
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py config\n"
+            "    python3 bosch_camera.py config set-quality Garten high"
+        ),
+    )
+    p_config.add_argument("sub", nargs="?", metavar="set-quality", help="Subcommand: set-quality")
+    p_config.add_argument(
+        "cam", nargs="?", metavar="<camera>", help="Camera name (for set-quality)"
+    )
+    p_config.add_argument(
+        "quality",
+        nargs="?",
+        choices=["auto", "high", "low"],
+        metavar="auto|high|low",
+        help="Quality preset to persist (for set-quality)",
     )
 
     # ── rcp ────────────────────────────────────────────────────────────────────
@@ -9646,6 +10316,93 @@ def main() -> None:
     p_nvr_upload.add_argument("cam", nargs="?", help="Camera name (optional)")
     p_nvr_upload.add_argument(
         "--clip", metavar="PATH", help="Upload a specific clip (default: all pending)"
+    )
+
+    # ── frigate-endpoint (BETA) ────────────────────────────────────────────────
+    p_frigate = subparsers.add_parser(
+        "frigate-endpoint",
+        help="BETA: always-on, credential-free RTSP front-door for external recorders",
+        description=(
+            "📹  frigate-endpoint — always-on, credential-free RTSP front-door\n"
+            "\n"
+            "  Opens one always-listening TCP socket per camera at a stable port.\n"
+            "  On the first client connection it opens a Bosch LOCAL session and\n"
+            "  performs the RTSP Digest-auth dance itself, so Frigate/BlueIris/go2rtc\n"
+            "  get a fully credential-free rtsp://127.0.0.1:<port>/... URL instead\n"
+            "  of one with rotating inline Digest credentials. Runs in the\n"
+            "  foreground until Ctrl+C.\n"
+            "\n"
+            "  Subcommands:\n"
+            "    start [<camera>] [options]  — start front-door(s) and block\n"
+            "\n"
+            "  ⚠️  BETA — test before use in production."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py frigate-endpoint start\n"
+            "    python3 bosch_camera.py frigate-endpoint start Garten --port 8554\n"
+            "    python3 bosch_camera.py frigate-endpoint start "
+            "--bind-host 0.0.0.0 --ip-allowlist 192.168.1.0/24\n"
+            "    python3 bosch_camera.py frigate-endpoint start "
+            "--auth-mode path_token --token mysecret"
+        ),
+    )
+    frigate_sub = p_frigate.add_subparsers(dest="frigate_sub", metavar="<subcommand>")
+
+    p_frigate_start = frigate_sub.add_parser(
+        "start", help="Start always-on front-door(s) and block until Ctrl+C"
+    )
+    p_frigate_start.add_argument("cam", nargs="?", help="Camera name (optional, default: all)")
+    p_frigate_start.add_argument(
+        "--bind-host",
+        dest="bind_host",
+        default="127.0.0.1",
+        metavar="HOST",
+        help="Interface to bind (default: 127.0.0.1, localhost-only)",
+    )
+    p_frigate_start.add_argument(
+        "--port",
+        type=int,
+        default=8554,
+        metavar="N",
+        help="Base port; camera N (sorted by name) binds to N+index (default: 8554)",
+    )
+    p_frigate_start.add_argument(
+        "--ip-allowlist",
+        dest="ip_allowlist",
+        default="",
+        metavar="CIDR,...",
+        help="Comma-separated IPs/CIDRs allowed to connect (default: allow all)",
+    )
+    p_frigate_start.add_argument(
+        "--auth-mode",
+        dest="auth_mode",
+        choices=["none", "path_token", "basic"],
+        default="none",
+        help="Optional gate on top of the IP allowlist (default: none)",
+    )
+    p_frigate_start.add_argument(
+        "--token",
+        dest="token",
+        default="",
+        metavar="SECRET",
+        help="Shared secret for --auth-mode path_token/basic",
+    )
+    p_frigate_start.add_argument(
+        "--basic-user",
+        dest="basic_user",
+        default="frigate",
+        metavar="USER",
+        help="Username for --auth-mode basic (default: frigate)",
+    )
+    p_frigate_start.add_argument(
+        "--idle-timeout",
+        dest="idle_timeout",
+        type=float,
+        default=60.0,
+        metavar="SEC",
+        help="Zero-client linger before logging idle (default: 60, 0=immediate)",
     )
 
     # ── intercom ────────────────────────────────────────────────────────────────
@@ -10308,6 +11065,42 @@ def main() -> None:
         help="Skip the confirmation prompt when installing on all cameras",
     )
 
+    # ── reset ─────────────────────────────────────────────────────────────────
+    p_reset = subparsers.add_parser(
+        "reset",
+        help="Reboot (soft) or factory-reset (hard) a camera",
+        description=(
+            "🔄  reset — camera soft/hard reset\n"
+            "\n"
+            "  API: PUT /v11/video_inputs/{id}/soft_reset | /hard_reset\n"
+            "\n"
+            "  --soft  reboots the camera (non-destructive, no re-pairing needed)\n"
+            "  --hard  FACTORY RESETS the camera (destructive — loses Bosch\n"
+            "          account pairing, requires re-commissioning via the app)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "  Examples:\n"
+            "    python3 bosch_camera.py reset Garten --soft\n"
+            "    python3 bosch_camera.py reset Garten --hard --confirm"
+        ),
+    )
+    p_reset.add_argument("cam", nargs="?", metavar="<camera>", help="Camera name or partial match")
+    p_reset.add_argument("--soft", action="store_true", help="Reboot the camera")
+    p_reset.add_argument(
+        "--hard", action="store_true", help="Factory-reset the camera (DESTRUCTIVE)"
+    )
+    p_reset.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Skip the interactive y/N prompt for --hard / fleet-wide --soft",
+    )
+    p_reset.add_argument(
+        "--all",
+        action="store_true",
+        help="Required opt-in to reboot every configured camera with --soft when no camera name is given",
+    )
+
     # ── rename ────────────────────────────────────────────────────────────
     p_rename = subparsers.add_parser(
         "rename",
@@ -10601,10 +11394,12 @@ def main() -> None:
         "lan-ips": cmd_lan_ips,
         "privacy": cmd_privacy,
         "light": cmd_light,
+        "lighting": cmd_lighting,
         "pan": cmd_pan,
         "notifications": cmd_notifications,
         "watch": cmd_watch,
         "nvr": cmd_nvr,
+        "frigate-endpoint": cmd_frigate_endpoint,
         "motion": cmd_motion,
         "recording": cmd_recording,
         "audio": cmd_audio,
@@ -10623,6 +11418,7 @@ def main() -> None:
         "privacy-masks": cmd_privacy_masks,
         "lighting-schedule": cmd_lighting_schedule,
         "firmware-update": cmd_firmware_update,
+        "reset": cmd_reset,
         "rename": cmd_rename,
         "profile": cmd_profile,
         "account": cmd_account,

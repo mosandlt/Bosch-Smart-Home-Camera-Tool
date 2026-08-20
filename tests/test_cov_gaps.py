@@ -554,6 +554,35 @@ class TestCmdRename:
         out = capsys.readouterr().out
         assert "❌" in out or "500" in out
 
+    def test_success_migrates_quality_pref_to_new_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Bug-hunt regression: a persisted `bosch config set-quality`
+        preference is keyed by camera NAME — renaming used to orphan it
+        under the old, now-nonexistent name instead of migrating it."""
+        cfg = _make_cfg()
+        cfg["settings"]["quality_pref"] = {CAM_NAME: "high"}
+        session = MagicMock()
+        session.put.return_value = _mock_response(200)
+        args = argparse.Namespace(cam=CAM_NAME, new_name="Garden")
+        with (
+            patch.object(bosch_camera, "get_token", return_value=_jwt()),
+            patch.object(bosch_camera, "make_session", return_value=session),
+            patch.object(bosch_camera, "get_cameras", return_value=cfg["cameras"]),
+            patch.object(bosch_camera, "save_config"),
+        ):
+            bosch_camera.cmd_rename(cfg, args)
+        capsys.readouterr()
+        assert cfg["settings"]["quality_pref"] == {"Garden": "high"}
+
+    def test_success_no_stored_pref_no_crash(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Renaming a camera with no persisted quality_pref at all must not
+        crash — nothing to migrate."""
+        args = argparse.Namespace(cam=CAM_NAME, new_name="Garden")
+        cfg = self._run_rename(args, _mock_response(200))
+        capsys.readouterr()
+        assert cfg.get("settings", {}).get("quality_pref", {}) == {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # cmd_profile branches — edit / 444 on profile fetch / 444 on edit

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bosch-smart-home-camera-tool"
-version = "10.12.4"
+version = "10.12.5"
 description = "Standalone command-line tool for Bosch Smart Home cameras (snapshots, livestream proxy, events, light/privacy control)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,6 +31,7 @@ bosch-camera = "bosch_camera:main"
 include = [
     "bosch_camera.py",
     "bosch_cloud_ssl.py",
+    "bosch_frigate_endpoint.py",
     "bosch_i18n.py",
     "bosch_maintenance.py",
     "bosch_rcp_client.py",
@@ -46,6 +47,7 @@ include = [
 only-include = [
     "bosch_camera.py",
     "bosch_cloud_ssl.py",
+    "bosch_frigate_endpoint.py",
     "bosch_i18n.py",
     "bosch_maintenance.py",
     "bosch_rcp_client.py",

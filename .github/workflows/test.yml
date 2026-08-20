@@ -40,7 +40,7 @@ jobs:
         run: ruff format --check .
 
       - name: Mypy strict
-        run: mypy bosch_camera.py bosch_cloud_ssl.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py
+        run: mypy bosch_camera.py bosch_cloud_ssl.py bosch_frigate_endpoint.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py
 
       # Coverage is scoped to the 5 modules the test suite actually imports.
       # get_token.py and start_proxy.py are standalone entry-point scripts
@@ -53,7 +53,7 @@ jobs:
       - name: Pytest with coverage gate
         run: |
           pytest tests/ -q \
-            --cov=bosch_camera --cov=bosch_cloud_ssl --cov=bosch_i18n \
+            --cov=bosch_camera --cov=bosch_cloud_ssl --cov=bosch_frigate_endpoint --cov=bosch_i18n \
             --cov=bosch_maintenance --cov=bosch_tls --cov=bosch_rcp_client \
             --cov-report=term-missing --cov-fail-under=90
 
@@ -76,10 +76,10 @@ jobs:
           pip install -r requirements-test.txt
 
       - name: pylint
-        run: pylint --rcfile=pyproject.toml bosch_camera.py bosch_cloud_ssl.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py
+        run: pylint --rcfile=pyproject.toml bosch_camera.py bosch_cloud_ssl.py bosch_frigate_endpoint.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py
 
       - name: codespell
-        run: codespell bosch_camera.py bosch_cloud_ssl.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py tests/ README.md CHANGELOG.md
+        run: codespell bosch_camera.py bosch_cloud_ssl.py bosch_frigate_endpoint.py bosch_i18n.py bosch_tls.py bosch_maintenance.py bosch_rcp_client.py get_token.py start_proxy.py tests/ README.md CHANGELOG.md
 
       - name: pip-audit (runtime deps)
         run: |
